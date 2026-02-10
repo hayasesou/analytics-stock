@@ -1,0 +1,29 @@
+# Node
+web/.next/
+web/node_modules/
+web/.vercel/
+
+# Python
+worker/.venv/
+worker/.pytest_cache/
+worker/.mypy_cache/
+worker/__pycache__/
+worker/**/*.pyc
+
+# Runtime artifacts
+*.log
+*.sqlite
+*.db
+.env
+.env.*
+!.env.example
+
+# Data artifacts
+artifacts/
+data/
+*.parquet
+
+# IDE
+.vscode/
+.idea/
+.DS_Store

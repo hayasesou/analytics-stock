@@ -1,0 +1,40 @@
+x-worker-base: &worker-base
+  build:
+    context: ./worker
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  environment:
+    TZ: ${TZ:-Asia/Tokyo}
+  volumes:
+    - ./config.yaml:/app/config.yaml:ro
+
+services:
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      NODE_ENV: production
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  worker:
+    <<: *worker-base
+    command: ["python", "-m", "src.main", "scheduler"]
+    restart: unless-stopped
+
+  worker-daily:
+    <<: *worker-base
+    command: ["python", "-m", "src.main", "daily"]
+    profiles: ["jobs"]
+
+  worker-weekly:
+    <<: *worker-base
+    command: ["python", "-m", "src.main", "weekly"]
+    profiles: ["jobs"]

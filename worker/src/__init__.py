@@ -1,0 +1,1 @@
+"""analytics-stock worker package."""

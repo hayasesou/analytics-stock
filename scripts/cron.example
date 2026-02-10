@@ -1,0 +1,6 @@
+# JST cron (set TZ=Asia/Tokyo in crontab header)
+# Daily 20:00
+0 20 * * * /bin/bash /opt/stock-analysis/scripts/daily.sh >> /opt/stock-analysis/logs/daily.log 2>&1
+
+# Weekly Saturday 06:30
+30 6 * * 6 /bin/bash /opt/stock-analysis/scripts/weekly.sh >> /opt/stock-analysis/logs/weekly.log 2>&1

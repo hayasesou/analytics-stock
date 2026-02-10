@@ -1,0 +1,185 @@
+version: 1.1
+baseline: frozen
+
+timezone: Asia/Tokyo
+
+schedules:
+  daily:
+    cron: "0 20 * * *"
+    job: jobs.daily
+  weekly:
+    cron: "30 6 * * 6"
+    job: jobs.weekly
+
+markets:
+  jp:
+    name: TSE Common Stocks
+    universe: jp_tse_common
+    code_format: "^[0-9]{4}$"
+    dcf:
+      wacc: 0.075
+      perpetual_growth: 0.01
+  us:
+    name: S&P 500
+    universe: us_sp500
+    dcf:
+      wacc: 0.09
+      perpetual_growth: 0.02
+
+ranking:
+  top_n: 50
+  hard_min:
+    jp: 10
+    us: 10
+  eligibility:
+    exclude_flags:
+      - low_liquidity
+      - severe_corporate_action
+      - data_quality_fail
+
+scoring:
+  normalization: percentile_within_market
+  styles:
+    - quality
+    - growth
+    - value
+    - momentum
+    - catalyst
+  weights:
+    quality: 0.25
+    growth: 0.20
+    value: 0.20
+    catalyst: 0.25
+    momentum: 0.10
+  penalties:
+    missing_ratio_threshold: 0.2
+    missing_ratio_penalty: 8.0
+    low_liquidity_penalty: 100.0
+
+confidence:
+  high:
+    min_primary_sources: 2
+    requires_key_numbers_with_citations: true
+    requires_no_major_contradiction: true
+    max_missing_ratio: 0.15
+
+signals:
+  enable: true
+  b_mode:
+    requires_confidence: High
+    max_rank: 10
+    event_boost_optional: true
+    valid_until_next_weekly: true
+  entry_cap_per_week:
+    normal: 3
+    extra_if_exception_met: 2
+    risk_alert_mode: 1
+
+risk_alert_mode:
+  trigger:
+    max_drawdown_breach: -0.10
+    manual_override: true
+  behavior:
+    entry_cap_per_week: 1
+    reduce_sector_exposure: true
+    defensive_allocation_bias: true
+
+risk_management:
+  atr:
+    period: 14
+    initial_stop_multiple: 2.5
+    trailing_stop_multiple: 3.0
+    partial_take_profit:
+      enabled: true
+      threshold: 0.20
+      ratio: 0.5
+    prioritize_fundamental_deterioration_exit: true
+
+backtest:
+  order_model:
+    entry: next_business_day_open
+  costs:
+    zero:
+      jp_round_trip_one_way: 0.0
+      us_round_trip_one_way: 0.0
+    standard:
+      jp_round_trip_one_way: 0.001
+      us_round_trip_one_way: 0.0008
+    strict:
+      jp_round_trip_one_way: 0.0015
+      us_round_trip_one_way: 0.0012
+  default_cost_profile: strict
+  metrics:
+    - cagr
+    - max_dd
+    - sharpe
+    - sortino
+    - volatility
+    - win_rate
+    - avg_win
+    - avg_loss
+    - alpha_simple
+    - information_ratio_simple
+
+reporting:
+  include_sections:
+    - weekly_summary
+    - top50_ranking
+    - security_report
+    - dcf_top10
+    - next_watch_points
+  claim_id_prefix: C
+  enforce_citation_for_important_claims: true
+  downgrade_uncited_to_hypothesis: true
+
+rag:
+  index_scope: evidence_vault_only
+  chunk_chars: 1200
+  overlap_chars: 150
+  top_k: 8
+
+budget_guard:
+  per_security:
+    max_documents: 12
+    max_pdf_extract_chars: 80000
+  monthly:
+    llm_budget_usd_env: LLM_MONTHLY_BUDGET_USD
+    fallback_mode: simplify_summaries
+
+storage:
+  cloud_only: true
+  evidence_vault_persistence: permanent
+  uncited_cache_ttl_days: 90
+  neon:
+    store:
+      - runs
+      - results
+      - citations
+      - chat_logs
+      - limited_embeddings
+  r2:
+    store:
+      - source_documents
+      - extracted_text
+      - price_parquet
+      - backtest_artifacts
+
+notifications:
+  discord:
+    daily:
+      high: detailed
+      medium: short
+      low: count_only
+    weekly:
+      - top50_link
+      - weekly_summary_link
+      - backtest_link
+
+data_sources:
+  jp_prices: jquants_light
+  us_prices: massive_stocks_starter
+  fx_usdjpy: fred
+  jp_disclosure:
+    - tdnet_scraping
+    - edinet_api
+  us_disclosure: sec_edgar
