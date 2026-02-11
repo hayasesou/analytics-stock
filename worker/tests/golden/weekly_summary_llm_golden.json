@@ -1,0 +1,24 @@
+{
+  "report_type": "weekly_summary",
+  "title": "LLM Weekly Summary 2026-02-11",
+  "body_md": "## 市況ハイライト\n- Top50を更新\n- 重要イベントを確認",
+  "conclusion": "High根拠のある銘柄を優先して監視継続",
+  "falsification_conditions": "一次情報の否定があれば結論を撤回",
+  "confidence": "Medium",
+  "security_id": null,
+  "claims": [
+    {
+      "claim_id": "C1",
+      "claim_text": "Top50 weekly ranking has been refreshed with mixed-market constraints",
+      "status": "supported"
+    }
+  ],
+  "citations": [
+    {
+      "claim_id": "C1",
+      "doc_version_id": "11111111-1111-1111-1111-111111111111",
+      "page_ref": "p1",
+      "quote_text": "売上見通しは据え置き。"
+    }
+  ]
+}
