@@ -16,7 +16,12 @@ from src.analytics.signal import generate_b_mode_signals
 from src.config import load_runtime_secrets, load_yaml_config
 from src.data.provider import HybridDataProvider
 from src.integrations.discord import DiscordNotifier
-from src.llm.reporting import generate_security_report, generate_weekly_summary_report
+from src.llm.reporting import (
+    generate_security_report,
+    generate_security_report_with_llm,
+    generate_weekly_summary_report_with_llm,
+    generate_weekly_summary_report,
+)
 from src.storage.db import NeonRepository
 from src.storage.r2 import R2Storage
 from src.types import CitationItem, ReportItem
@@ -25,6 +30,24 @@ EVIDENCE_LOOKBACK_DAYS = 30
 SECURITY_REPORT_CITATION_LIMIT = 3
 SIGNAL_DIAGNOSTIC_LOOKBACK_DAYS = 730
 SIGNAL_DIAGNOSTIC_HORIZONS = (5, 20, 60)
+LLM_SECURITY_REPORTS_ENABLED_ENV = "LLM_SECURITY_REPORTS_ENABLED"
+LLM_WEEKLY_SUMMARY_ENABLED_ENV = "LLM_WEEKLY_SUMMARY_ENABLED"
+OPENAI_MODEL_ENV = "OPENAI_MODEL"
+DEFAULT_OPENAI_MODEL = "gpt-5-mini"
+LLM_SECURITY_REPORT_TIMEOUT_SEC_ENV = "LLM_SECURITY_REPORT_TIMEOUT_SEC"
+LLM_WEEKLY_SUMMARY_TIMEOUT_SEC_ENV = "LLM_WEEKLY_SUMMARY_TIMEOUT_SEC"
+LLM_SECURITY_REPORT_MAX_OUTPUT_TOKENS_ENV = "LLM_SECURITY_REPORT_MAX_OUTPUT_TOKENS"
+LLM_WEEKLY_SUMMARY_MAX_OUTPUT_TOKENS_ENV = "LLM_WEEKLY_SUMMARY_MAX_OUTPUT_TOKENS"
+LLM_SECURITY_REPORT_MAX_CALLS_ENV = "LLM_SECURITY_REPORT_MAX_CALLS"
+LLM_SECURITY_REPORT_MAX_CONSECUTIVE_FAILURES_ENV = "LLM_SECURITY_REPORT_MAX_CONSECUTIVE_FAILURES"
+LLM_SECURITY_REPORT_BUDGET_SEC_ENV = "LLM_SECURITY_REPORT_BUDGET_SEC"
+DEFAULT_LLM_SECURITY_REPORT_TIMEOUT_SEC = 12.0
+DEFAULT_LLM_WEEKLY_SUMMARY_TIMEOUT_SEC = 12.0
+DEFAULT_LLM_SECURITY_REPORT_MAX_OUTPUT_TOKENS = 750
+DEFAULT_LLM_WEEKLY_SUMMARY_MAX_OUTPUT_TOKENS = 600
+DEFAULT_LLM_SECURITY_REPORT_MAX_CALLS = 20
+DEFAULT_LLM_SECURITY_REPORT_MAX_CONSECUTIVE_FAILURES = 3
+DEFAULT_LLM_SECURITY_REPORT_BUDGET_SEC = 180.0
 
 
 def _to_security_frame(securities) -> pd.DataFrame:
@@ -134,6 +157,35 @@ def _compute_signal_diagnostics(
         )
 
     return diagnostics
+
+
+def _resolve_openai_model(model: str | None) -> str:
+    selected = (model or "").strip()
+    return selected or DEFAULT_OPENAI_MODEL
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[weekly] invalid_int_env name={name} value={raw!r}; fallback={default}", flush=True)
+        return default
+    return max(value, minimum)
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"[weekly] invalid_float_env name={name} value={raw!r}; fallback={default}", flush=True)
+        return default
+    return max(value, minimum)
 
 
 def run_weekly() -> str:
@@ -253,7 +305,72 @@ def run_weekly() -> str:
         ]
         stage_started = _log_stage("load_events", stage_started, run_started, extra=f"count={len(weekly_events)}")
 
-        summary_report = generate_weekly_summary_report(run_id, now, top50, weekly_event_dicts)
+        llm_model = _resolve_openai_model(os.getenv(OPENAI_MODEL_ENV, ""))
+        llm_weekly_summary_enabled = (
+            os.getenv(LLM_WEEKLY_SUMMARY_ENABLED_ENV, "0") == "1"
+            and bool(secrets.openai_api_key)
+        )
+        llm_security_reports_enabled = (
+            os.getenv(LLM_SECURITY_REPORTS_ENABLED_ENV, "0") == "1"
+            and bool(secrets.openai_api_key)
+        )
+        llm_security_timeout_sec = _env_float(
+            LLM_SECURITY_REPORT_TIMEOUT_SEC_ENV,
+            DEFAULT_LLM_SECURITY_REPORT_TIMEOUT_SEC,
+            minimum=3.0,
+        )
+        llm_weekly_summary_timeout_sec = _env_float(
+            LLM_WEEKLY_SUMMARY_TIMEOUT_SEC_ENV,
+            DEFAULT_LLM_WEEKLY_SUMMARY_TIMEOUT_SEC,
+            minimum=3.0,
+        )
+        llm_security_max_output_tokens = _env_int(
+            LLM_SECURITY_REPORT_MAX_OUTPUT_TOKENS_ENV,
+            DEFAULT_LLM_SECURITY_REPORT_MAX_OUTPUT_TOKENS,
+            minimum=100,
+        )
+        llm_weekly_summary_max_output_tokens = _env_int(
+            LLM_WEEKLY_SUMMARY_MAX_OUTPUT_TOKENS_ENV,
+            DEFAULT_LLM_WEEKLY_SUMMARY_MAX_OUTPUT_TOKENS,
+            minimum=100,
+        )
+        llm_security_max_calls = _env_int(
+            LLM_SECURITY_REPORT_MAX_CALLS_ENV,
+            DEFAULT_LLM_SECURITY_REPORT_MAX_CALLS,
+            minimum=1,
+        )
+        llm_security_max_consecutive_failures = _env_int(
+            LLM_SECURITY_REPORT_MAX_CONSECUTIVE_FAILURES_ENV,
+            DEFAULT_LLM_SECURITY_REPORT_MAX_CONSECUTIVE_FAILURES,
+            minimum=1,
+        )
+        llm_security_budget_sec = _env_float(
+            LLM_SECURITY_REPORT_BUDGET_SEC_ENV,
+            DEFAULT_LLM_SECURITY_REPORT_BUDGET_SEC,
+            minimum=10.0,
+        )
+
+        if llm_weekly_summary_enabled:
+            try:
+                summary_report = generate_weekly_summary_report_with_llm(
+                    run_id=run_id,
+                    as_of=now,
+                    top50=top50,
+                    events=weekly_event_dicts,
+                    model=llm_model,
+                    api_key=secrets.openai_api_key,
+                    timeout_sec=llm_weekly_summary_timeout_sec,
+                    max_output_tokens=llm_weekly_summary_max_output_tokens,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[weekly] llm_weekly_summary_failed run_id={run_id} error={exc}; fallback=template",
+                    flush=True,
+                )
+                summary_report = generate_weekly_summary_report(run_id, now, top50, weekly_event_dicts)
+        else:
+            summary_report = generate_weekly_summary_report(run_id, now, top50, weekly_event_dicts)
+
         reports_to_insert: list[ReportItem] = [summary_report]
         citations_by_security = repo.get_recent_citations_by_security(
             top50["security_id"].tolist(),
@@ -262,10 +379,75 @@ def run_weekly() -> str:
         )
 
         top10_ids = set(top50.sort_values("mixed_rank").head(10)["security_id"])
+        llm_security_reports_runtime_enabled = llm_security_reports_enabled
+        llm_security_calls = 0
+        llm_security_consecutive_failures = 0
+        llm_security_window_started = perf_counter()
         for _, row in top50.iterrows():
             security_citations = citations_by_security.get(row["security_id"], [])
             dcf_md = render_dcf_markdown(dcf_df, row["security_id"]) if row["security_id"] in top10_ids else None
-            sec_report = generate_security_report(row, now, evidence_citations=security_citations, dcf_markdown=dcf_md)
+            llm_security_elapsed = perf_counter() - llm_security_window_started
+            if llm_security_reports_runtime_enabled and llm_security_calls >= llm_security_max_calls:
+                llm_security_reports_runtime_enabled = False
+                print(
+                    f"[weekly] llm_security_reports_disabled reason=max_calls calls={llm_security_calls} threshold={llm_security_max_calls}",
+                    flush=True,
+                )
+            if llm_security_reports_runtime_enabled and llm_security_elapsed >= llm_security_budget_sec:
+                llm_security_reports_runtime_enabled = False
+                print(
+                    f"[weekly] llm_security_reports_disabled reason=budget elapsed_sec={llm_security_elapsed:.2f} budget_sec={llm_security_budget_sec:.2f}",
+                    flush=True,
+                )
+            if (
+                llm_security_reports_runtime_enabled
+                and llm_security_consecutive_failures >= llm_security_max_consecutive_failures
+            ):
+                llm_security_reports_runtime_enabled = False
+                print(
+                    f"[weekly] llm_security_reports_disabled reason=circuit_breaker failures={llm_security_consecutive_failures}",
+                    flush=True,
+                )
+
+            if llm_security_reports_runtime_enabled:
+                llm_security_calls += 1
+                try:
+                    sec_report = generate_security_report_with_llm(
+                        row,
+                        now,
+                        evidence_citations=security_citations,
+                        dcf_markdown=dcf_md,
+                        model=llm_model,
+                        api_key=secrets.openai_api_key,
+                        timeout_sec=llm_security_timeout_sec,
+                        max_output_tokens=llm_security_max_output_tokens,
+                    )
+                    llm_security_consecutive_failures = 0
+                except Exception as exc:  # noqa: BLE001
+                    llm_security_consecutive_failures += 1
+                    print(
+                        f"[weekly] llm_security_report_failed security={row['security_id']} error={exc} consecutive_failures={llm_security_consecutive_failures}; fallback=template",
+                        flush=True,
+                    )
+                    if llm_security_consecutive_failures >= llm_security_max_consecutive_failures:
+                        llm_security_reports_runtime_enabled = False
+                        print(
+                            f"[weekly] llm_security_reports_disabled reason=circuit_breaker failures={llm_security_consecutive_failures}",
+                            flush=True,
+                        )
+                    sec_report = generate_security_report(
+                        row,
+                        now,
+                        evidence_citations=security_citations,
+                        dcf_markdown=dcf_md,
+                    )
+            else:
+                sec_report = generate_security_report(
+                    row,
+                    now,
+                    evidence_citations=security_citations,
+                    dcf_markdown=dcf_md,
+                )
             reports_to_insert.append(sec_report)
 
             if row["security_id"] in top10_ids:
@@ -333,6 +515,9 @@ def run_weekly() -> str:
                 "signals": int(signals["entry_allowed"].sum()) if not signals.empty else 0,
                 "backtest_profiles": len(bt_results),
                 "signal_diagnostics": signal_diagnostics,
+                "llm_security_calls": llm_security_calls,
+                "llm_security_failures": llm_security_consecutive_failures,
+                "llm_security_runtime_enabled_end": llm_security_reports_runtime_enabled,
             },
         )
         _log_stage("finish_run", stage_started, run_started)

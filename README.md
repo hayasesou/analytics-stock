@@ -70,3 +70,27 @@ docker compose --profile jobs run --rm worker-weekly
 - 週次: 土曜 06:30 (`jobs.weekly`)
 
 `scripts/` に cron 用ラッパーを配置しています。
+
+## LLM 生成（任意）
+
+- 週次の `security_full` レポート本文生成を OpenAI で有効化できます。
+- 週次の `weekly_summary` 生成も OpenAI で有効化できます。
+- 既定モデルは `gpt-5-mini`（`OPENAI_MODEL`）です。
+- 有効化フラグ:
+  - `LLM_SECURITY_REPORTS_ENABLED=1`
+  - `LLM_WEEKLY_SUMMARY_ENABLED=1`
+- 安全装置（任意・既定値あり）:
+  - `LLM_SECURITY_REPORT_MAX_CALLS=20`
+  - `LLM_SECURITY_REPORT_MAX_CONSECUTIVE_FAILURES=3`
+  - `LLM_SECURITY_REPORT_BUDGET_SEC=180`
+  - `LLM_SECURITY_REPORT_TIMEOUT_SEC=12`
+  - `LLM_WEEKLY_SUMMARY_TIMEOUT_SEC=12`
+- 未設定/0 の場合は既存テンプレ生成です。
+
+### LLM テスト
+
+```bash
+cd worker
+pytest -q -k "llm_reporting_unit or llm_weekly_summary_unit or llm_reporting_golden or llm_weekly_summary_golden or openai_client"
+RUN_LLM_LIVE=1 OPENAI_API_KEY=... OPENAI_MODEL=gpt-5-mini pytest -q -m llm_live
+```
