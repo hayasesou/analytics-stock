@@ -94,3 +94,14 @@ cd worker
 pytest -q -k "llm_reporting_unit or llm_weekly_summary_unit or llm_reporting_golden or llm_weekly_summary_golden or openai_client"
 RUN_LLM_LIVE=1 OPENAI_API_KEY=... OPENAI_MODEL=gpt-5-mini pytest -q -m llm_live
 ```
+
+## PR マージ運用（CI通過後）
+
+- `ci` workflow が PR ごとに `worker-tests` と `web-build` を実行します。
+- 本リポジトリは GitHub プラン制約で branch protection の必須チェックを強制できないため、マージ時は以下スクリプトを使ってください。
+
+```bash
+bash scripts/merge_after_ci.sh <PR番号> --merge
+```
+
+- スクリプトは `worker-tests` / `web-build` が `success` になるまで待機し、失敗ならマージせず終了します。
