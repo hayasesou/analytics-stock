@@ -57,19 +57,22 @@ def generate_weekly_summary_report(
         {
             "claim_id": "C1",
             "claim_text": "Top50 weekly ranking has been refreshed with mixed-market constraints",
-            "status": "supported",
+            "status": "hypothesis",
         }
     ]
     citations: list[CitationItem] = []
     if events and events[0].get("doc_version_id"):
-        citations.append(
-            CitationItem(
-                claim_id="C1",
-                doc_version_id=str(events[0]["doc_version_id"]),
-                page_ref="p1",
-                quote_text=f"Weekly summary references event: {events[0]['title']}",
+        quote_text = str(events[0].get("summary") or events[0].get("title") or "").strip()
+        if quote_text:
+            claims[0]["status"] = "supported"
+            citations.append(
+                CitationItem(
+                    claim_id="C1",
+                    doc_version_id=str(events[0]["doc_version_id"]),
+                    page_ref="p1",
+                    quote_text=quote_text,
+                )
             )
-        )
 
     return ReportItem(
         report_type="weekly_summary",
@@ -86,12 +89,13 @@ def generate_weekly_summary_report(
 def generate_security_report(
     row: pd.Series,
     as_of: datetime,
-    evidence: dict[str, str],
+    evidence_citations: list[CitationItem] | None = None,
     dcf_markdown: str | None = None,
 ) -> ReportItem:
     c1 = "C1"
     c2 = "C2"
     c3 = "C3"
+    claim_ids = [c1, c2, c3]
 
     body_lines = [
         f"# {row['security_id']} レポート ({as_of.date().isoformat()})",
@@ -114,31 +118,35 @@ def generate_security_report(
     if dcf_markdown:
         body_lines.extend(["", "## DCF（Top10のみ）", dcf_markdown])
 
-    citations = [
-        CitationItem(
-            claim_id=c1,
-            doc_version_id=evidence["doc_version_id"],
-            page_ref=evidence["page_ref"],
-            quote_text=evidence["quote_text"],
-        ),
-        CitationItem(
-            claim_id=c2,
-            doc_version_id=evidence["doc_version_id"],
-            page_ref=evidence["page_ref"],
-            quote_text="Missing ratio and liquidity gates are applied in weekly scoring.",
-        ),
-        CitationItem(
-            claim_id=c3,
-            doc_version_id=evidence["doc_version_id"],
-            page_ref=evidence["page_ref"],
-            quote_text="B-mode signal requires High confidence and Top10 rank.",
-        ),
-    ]
+    raw_citations = list(evidence_citations or [])
+    citations: list[CitationItem] = []
+    for claim_id, citation in zip(claim_ids, raw_citations, strict=False):
+        citations.append(
+            CitationItem(
+                claim_id=claim_id,
+                doc_version_id=citation.doc_version_id,
+                page_ref=citation.page_ref,
+                quote_text=citation.quote_text,
+            )
+        )
+    supported_claim_ids = {citation.claim_id for citation in citations}
 
     claims = [
-        {"claim_id": c1, "claim_text": "総合スコアは市場内で相対上位", "status": "supported"},
-        {"claim_id": c2, "claim_text": "欠損率と流動性を考慮して監視継続", "status": "supported"},
-        {"claim_id": c3, "claim_text": "シグナル条件は High かつ Top10", "status": "supported"},
+        {
+            "claim_id": c1,
+            "claim_text": "総合スコアは市場内で相対上位",
+            "status": "supported" if c1 in supported_claim_ids else "hypothesis",
+        },
+        {
+            "claim_id": c2,
+            "claim_text": "欠損率と流動性を考慮して監視継続",
+            "status": "supported" if c2 in supported_claim_ids else "hypothesis",
+        },
+        {
+            "claim_id": c3,
+            "claim_text": "シグナル条件は High かつ Top10",
+            "status": "supported" if c3 in supported_claim_ids else "hypothesis",
+        },
     ]
 
     return ReportItem(

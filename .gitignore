@@ -2,6 +2,7 @@
 web/.next/
 web/node_modules/
 web/.vercel/
+web/tsconfig.tsbuildinfo
 
 # Python
 worker/.venv/
@@ -20,7 +21,7 @@ worker/**/*.pyc
 
 # Data artifacts
 artifacts/
-data/
+/data/
 *.parquet
 
 # IDE

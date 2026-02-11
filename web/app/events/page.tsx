@@ -2,6 +2,23 @@ export const dynamic = "force-dynamic";
 
 import { fetchDailyEvents } from "@/lib/repository";
 
+function formatJst(ts: string): string {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) {
+    return ts;
+  }
+  return d.toLocaleString("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  });
+}
+
 export default async function EventsPage() {
   const rows = await fetchDailyEvents();
   const high = rows.filter((r) => r.importance === "high");
@@ -46,7 +63,7 @@ export default async function EventsPage() {
                   <td>
                     <span className={`pill ${r.importance}`}>{r.importance}</span>
                   </td>
-                  <td>{r.eventTime}</td>
+                  <td>{formatJst(r.eventTime)} JST</td>
                   <td>{r.eventType}</td>
                   <td>{r.title}</td>
                   <td>{r.summary}</td>

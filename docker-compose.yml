@@ -10,6 +10,16 @@ x-worker-base: &worker-base
     - ./config.yaml:/app/config.yaml:ro
 
 services:
+  db-bootstrap:
+    image: postgres:16-alpine
+    env_file:
+      - .env
+    volumes:
+      - ./infra/sql:/sql:ro
+    entrypoint: ["sh", "-lc"]
+    command: ['psql "$NEON_DATABASE_URL" -f /sql/schema.sql']
+    profiles: ["setup"]
+
   web:
     build:
       context: ./web

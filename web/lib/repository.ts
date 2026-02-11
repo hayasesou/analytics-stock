@@ -7,8 +7,25 @@ import {
   CitationRecord,
   EventRecord,
   ReportRecord,
-  Top50Row
+  SecurityTimelineData,
+  Top50Row,
+  WeeklyActionData
 } from "@/lib/types";
+
+function decodeSecurityId(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function clampLookbackDays(days: number): number {
+  if (!Number.isFinite(days)) {
+    return 180;
+  }
+  return Math.min(3650, Math.max(1, Math.trunc(days)));
+}
 
 export async function latestRunId(runType: "weekly" | "daily"): Promise<string | null> {
   const sql = getSql();
@@ -32,46 +49,105 @@ export async function fetchTop50(runId?: string): Promise<Top50Row[]> {
   const rows = await sql<
     {
       rank: number;
+      prev_rank: number | null;
+      rank_delta: number | null;
       security_id: string;
       market: "JP" | "US";
       ticker: string;
       name: string;
       sector: string | null;
+      quality: number | null;
+      growth: number | null;
+      value: number | null;
+      momentum: number | null;
+      catalyst: number | null;
       combined_score: number;
+      score_delta: number | null;
+      edge_score: number | null;
+      missing_ratio: number | null;
+      liquidity_flag: boolean | null;
+      selection_reason: string | null;
       confidence: "High" | "Medium" | "Low";
       is_signal: boolean;
       entry_allowed: boolean;
+      signal_reason: string | null;
       valid_until: string | null;
     }[]
   >`
+    with target_run as (
+      select id, coalesce(finished_at, started_at) as ordering_time
+      from runs
+      where id = ${targetRun}::uuid
+      limit 1
+    ),
+    prev_run as (
+      select r.id
+      from runs r
+      join target_run t on true
+      where r.run_type = 'weekly'
+        and r.status = 'success'
+        and r.id <> t.id
+        and coalesce(r.finished_at, r.started_at) < t.ordering_time
+      order by coalesce(r.finished_at, r.started_at) desc, r.started_at desc
+      limit 1
+    )
     select
       t.rank,
+      prev_t.rank as prev_rank,
+      (prev_t.rank - t.rank) as rank_delta,
       s.security_id,
       s.market,
       s.ticker,
       s.name,
       s.sector,
+      sc.quality,
+      sc.growth,
+      sc.value,
+      sc.momentum,
+      sc.catalyst,
       sc.combined_score,
+      (sc.combined_score - prev_sc.combined_score) as score_delta,
+      nullif(sc.flags->>'edge_score', '')::double precision as edge_score,
+      sc.missing_ratio,
+      sc.liquidity_flag,
+      t.reason as selection_reason,
       sc.confidence,
       coalesce(sig.is_signal, false) as is_signal,
       coalesce(sig.entry_allowed, false) as entry_allowed,
+      sig.reason as signal_reason,
       sig.valid_until::text
     from top50_membership t
     join securities s on s.id = t.security_id
     left join score_snapshots sc on sc.run_id = t.run_id and sc.security_id = s.id
     left join signals sig on sig.run_id = t.run_id and sig.security_id = s.id
+    left join prev_run pr on true
+    left join top50_membership prev_t on prev_t.run_id = pr.id and prev_t.security_id = s.id
+    left join score_snapshots prev_sc on prev_sc.run_id = pr.id and prev_sc.security_id = s.id
     where t.run_id = ${targetRun}::uuid
     order by t.rank asc
   `;
 
   return rows.map((r) => ({
     rank: r.rank,
+    rankPrev: r.prev_rank,
+    rankDelta: r.rank_delta,
     securityId: r.security_id,
     market: r.market,
     ticker: r.ticker,
     name: r.name,
     sector: r.sector,
     score: Number(r.combined_score ?? 0),
+    scoreDelta: r.score_delta == null ? null : Number(r.score_delta),
+    edgeScore: Number(r.edge_score ?? 0),
+    quality: Number(r.quality ?? 0),
+    growth: Number(r.growth ?? 0),
+    value: Number(r.value ?? 0),
+    momentum: Number(r.momentum ?? 0),
+    catalyst: Number(r.catalyst ?? 0),
+    missingRatio: Number(r.missing_ratio ?? 0),
+    liquidityFlag: Boolean(r.liquidity_flag),
+    selectionReason: r.selection_reason,
+    signalReason: r.signal_reason,
     confidence: r.confidence,
     isSignal: r.is_signal,
     entryAllowed: r.entry_allowed,
@@ -79,8 +155,121 @@ export async function fetchTop50(runId?: string): Promise<Top50Row[]> {
   }));
 }
 
+export async function fetchSecurityTimeline(
+  securityId: string,
+  days = 180
+): Promise<SecurityTimelineData | null> {
+  const sql = getSql();
+  const normalizedSecurityId = decodeSecurityId(securityId);
+  const lookbackDays = clampLookbackDays(days);
+
+  const securityRows = await sql<{ id: string }[]>`
+    select id::text as id
+    from securities
+    where security_id = ${normalizedSecurityId}
+    limit 1
+  `;
+  const security = securityRows[0];
+  if (!security) {
+    return null;
+  }
+
+  const [priceRows, signalRows, eventRows] = await Promise.all([
+    sql<
+      {
+        trade_date: string;
+        close_raw: number;
+      }[]
+    >`
+      select
+        trade_date::text as trade_date,
+        close_raw
+      from prices_daily
+      where security_id = ${security.id}::uuid
+        and trade_date >= current_date - (${lookbackDays}::int * interval '1 day')
+      order by trade_date asc
+    `,
+    sql<
+      {
+        as_of_date: string;
+        is_signal: boolean;
+        entry_allowed: boolean;
+        reason: string | null;
+        rank: number | null;
+        confidence: "High" | "Medium" | "Low" | null;
+        valid_until: string | null;
+      }[]
+    >`
+      select
+        as_of_date::text as as_of_date,
+        is_signal,
+        entry_allowed,
+        reason,
+        rank,
+        confidence,
+        valid_until::text as valid_until
+      from signals
+      where security_id = ${security.id}::uuid
+        and as_of_date >= current_date - (${lookbackDays}::int * interval '1 day')
+      order by as_of_date asc
+    `,
+    sql<
+      {
+        event_time: string;
+        event_date: string;
+        title: string;
+        summary: string;
+        importance: "high" | "medium" | "low";
+        event_type: string;
+        source_url: string | null;
+      }[]
+    >`
+      select
+        event_time::text as event_time,
+        (event_time at time zone 'UTC')::date::text as event_date,
+        title,
+        summary,
+        importance,
+        event_type,
+        source_url
+      from events
+      where security_id = ${security.id}::uuid
+        and event_time >= now() - (${lookbackDays}::int * interval '1 day')
+      order by event_time asc
+    `
+  ]);
+
+  return {
+    securityId: normalizedSecurityId,
+    days: lookbackDays,
+    prices: priceRows.map((r) => ({
+      date: r.trade_date,
+      close: Number(r.close_raw ?? 0)
+    })),
+    signals: signalRows.map((r) => ({
+      date: r.as_of_date,
+      isSignal: Boolean(r.is_signal),
+      entryAllowed: Boolean(r.entry_allowed),
+      reason: r.reason,
+      rank: r.rank,
+      confidence: r.confidence,
+      validUntil: r.valid_until
+    })),
+    events: eventRows.map((r) => ({
+      date: r.event_date,
+      eventTime: r.event_time,
+      title: r.title,
+      summary: r.summary,
+      importance: r.importance,
+      eventType: r.event_type,
+      sourceUrl: r.source_url
+    }))
+  };
+}
+
 export async function fetchReportsBySecurity(securityId: string): Promise<ReportRecord[]> {
   const sql = getSql();
+  const normalizedSecurityId = decodeSecurityId(securityId);
   const rows = await sql<
     {
       id: string;
@@ -106,7 +295,7 @@ export async function fetchReportsBySecurity(securityId: string): Promise<Report
       r.created_at::text
     from reports r
     left join securities s on s.id = r.security_id
-    where s.security_id = ${securityId}
+    where s.security_id = ${normalizedSecurityId}
     order by r.created_at desc
   `;
 
@@ -169,6 +358,170 @@ export async function fetchWeeklySummary(): Promise<ReportRecord | null> {
     falsificationConditions: row[0].falsification_conditions,
     confidence: row[0].confidence,
     createdAt: row[0].created_at
+  };
+}
+
+export async function fetchWeeklyActionData(): Promise<WeeklyActionData> {
+  const sql = getSql();
+  const runRows = await sql<{ id: string }[]>`
+    select id::text as id
+    from runs
+    where run_type = 'weekly' and status = 'success'
+    order by finished_at desc nulls last, started_at desc
+    limit 2
+  `;
+
+  const latestRunId = runRows[0]?.id ?? null;
+  const previousRunId = runRows[1]?.id ?? null;
+
+  if (!latestRunId) {
+    return {
+      latestRunId: null,
+      previousRunId: null,
+      highConfidenceTop10: [],
+      liquidityChanges: [],
+      strictMetric: null,
+      signalDiagnostics: []
+    };
+  }
+
+  const topRows = await sql<
+    {
+      rank: number;
+      security_id: string;
+      ticker: string;
+      name: string;
+      market: "JP" | "US";
+    }[]
+  >`
+    select
+      t.rank,
+      s.security_id,
+      s.ticker,
+      s.name,
+      s.market
+    from top50_membership t
+    join score_snapshots sc on sc.run_id = t.run_id and sc.security_id = t.security_id
+    join securities s on s.id = t.security_id
+    where t.run_id = ${latestRunId}::uuid
+      and t.rank <= 10
+      and sc.confidence = 'High'
+    order by t.rank asc
+  `;
+
+  let liquidityRows: {
+    security_id: string;
+    ticker: string;
+    name: string;
+    market: "JP" | "US";
+    previous_liquidity_flag: boolean;
+    current_liquidity_flag: boolean;
+  }[] = [];
+  if (previousRunId) {
+    liquidityRows = await sql<
+      {
+        security_id: string;
+        ticker: string;
+        name: string;
+        market: "JP" | "US";
+        previous_liquidity_flag: boolean;
+        current_liquidity_flag: boolean;
+      }[]
+    >`
+      select
+        s.security_id,
+        s.ticker,
+        s.name,
+        s.market,
+        prev.liquidity_flag as previous_liquidity_flag,
+        curr.liquidity_flag as current_liquidity_flag
+      from score_snapshots curr
+      join score_snapshots prev
+        on prev.security_id = curr.security_id
+       and prev.run_id = ${previousRunId}::uuid
+      join securities s on s.id = curr.security_id
+      where curr.run_id = ${latestRunId}::uuid
+        and curr.liquidity_flag is distinct from prev.liquidity_flag
+      order by s.market asc, s.security_id asc
+      limit 100
+    `;
+  }
+
+  const strictRows = await sql<
+    {
+      cagr: number | null;
+      max_dd: number | null;
+      sharpe: number | null;
+    }[]
+  >`
+    select
+      m.cagr,
+      m.max_dd,
+      m.sharpe
+    from backtest_runs br
+    join backtest_metrics m on m.backtest_run_id = br.id
+    where br.run_id = ${latestRunId}::uuid
+      and m.cost_profile = 'strict'
+      and m.market_scope = 'MIXED'
+    order by br.created_at desc
+    limit 1
+  `;
+
+  const diagnosticRows = await sql<
+    {
+      horizon_days: number;
+      hit_rate: number;
+      median_return: number | null;
+      p10_return: number | null;
+      p90_return: number | null;
+      sample_size: number;
+    }[]
+  >`
+    select
+      horizon_days,
+      hit_rate,
+      median_return,
+      p10_return,
+      p90_return,
+      sample_size
+    from signal_diagnostics_weekly
+    where run_id = ${latestRunId}::uuid
+    order by horizon_days asc
+  `;
+
+  return {
+    latestRunId,
+    previousRunId,
+    highConfidenceTop10: topRows.map((r) => ({
+      rank: r.rank,
+      securityId: r.security_id,
+      ticker: r.ticker,
+      name: r.name,
+      market: r.market
+    })),
+    liquidityChanges: liquidityRows.map((r) => ({
+      securityId: r.security_id,
+      ticker: r.ticker,
+      name: r.name,
+      market: r.market,
+      previousLiquidityFlag: r.previous_liquidity_flag,
+      currentLiquidityFlag: r.current_liquidity_flag
+    })),
+    strictMetric: strictRows[0]
+      ? {
+          cagr: Number(strictRows[0].cagr ?? 0),
+          maxDd: Number(strictRows[0].max_dd ?? 0),
+          sharpe: Number(strictRows[0].sharpe ?? 0)
+        }
+      : null,
+    signalDiagnostics: diagnosticRows.map((r) => ({
+      horizonDays: ([5, 20, 60].includes(r.horizon_days) ? r.horizon_days : 5) as 5 | 20 | 60,
+      hitRate: Number(r.hit_rate ?? 0),
+      medianReturn: r.median_return == null ? null : Number(r.median_return),
+      p10Return: r.p10_return == null ? null : Number(r.p10_return),
+      p90Return: r.p90_return == null ? null : Number(r.p90_return),
+      sampleSize: Number(r.sample_size ?? 0)
+    }))
   };
 }
 
@@ -314,6 +667,25 @@ export async function fetchBacktestData(): Promise<{
     order by trade_date asc
   `;
 
+  const rawCurve = curveRows.map((r) => ({
+    costProfile: r.cost_profile,
+    tradeDate: r.trade_date,
+    equity: Number(r.equity ?? 0),
+    benchmarkEquity: r.benchmark_equity == null ? null : Number(r.benchmark_equity)
+  }));
+
+  const peakByCost = new Map<string, number>();
+  const curve = rawCurve.map((p) => {
+    const prevPeak = peakByCost.get(p.costProfile) ?? p.equity;
+    const peak = Math.max(prevPeak, p.equity);
+    peakByCost.set(p.costProfile, peak);
+    const drawdown = peak > 0 ? p.equity / peak - 1 : 0;
+    return {
+      ...p,
+      drawdown
+    };
+  });
+
   return {
     metrics: metricsRows.map((r) => ({
       costProfile: r.cost_profile,
@@ -328,12 +700,7 @@ export async function fetchBacktestData(): Promise<{
       alphaSimple: Number(r.alpha_simple ?? 0),
       informationRatioSimple: Number(r.information_ratio_simple ?? 0)
     })),
-    curve: curveRows.map((r) => ({
-      costProfile: r.cost_profile,
-      tradeDate: r.trade_date,
-      equity: Number(r.equity ?? 0),
-      benchmarkEquity: r.benchmark_equity == null ? null : Number(r.benchmark_equity)
-    }))
+    curve
   };
 }
 
@@ -427,12 +794,19 @@ export async function fetchLatestAssistantAnswer(sessionId: string): Promise<str
   return row[0]?.content ?? null;
 }
 
-export async function searchEvidenceFromReports(query: string): Promise<{
+export async function searchEvidenceFromReports(
+  query: string,
+  options?: { securityId?: string | null; periodDays?: number | null }
+): Promise<{
   report: ReportRecord;
   citations: CitationRecord[];
 }[]> {
   const sql = getSql();
   const q = `%${query}%`;
+  const securityId = options?.securityId?.trim() ? decodeSecurityId(options.securityId.trim()) : null;
+  const periodDays = options?.periodDays && Number.isFinite(options.periodDays)
+    ? Math.max(1, Math.trunc(options.periodDays))
+    : null;
   const reports = await sql<
     {
       id: string;
@@ -458,9 +832,13 @@ export async function searchEvidenceFromReports(query: string): Promise<{
       r.created_at::text
     from reports r
     left join securities s on s.id = r.security_id
-    where r.body_md ilike ${q}
-       or r.title ilike ${q}
-       or r.conclusion ilike ${q}
+    where (
+      r.body_md ilike ${q}
+      or r.title ilike ${q}
+      or r.conclusion ilike ${q}
+    )
+      and (${securityId}::text is null or s.security_id = ${securityId})
+      and (${periodDays}::int is null or r.created_at >= now() - (${periodDays}::int * interval '1 day'))
     order by r.created_at desc
     limit 5
   `;

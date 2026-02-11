@@ -6,15 +6,16 @@ from datetime import date, datetime
 import hashlib
 import json
 from typing import Any, Iterator
+from uuid import uuid4
 
 import pandas as pd
 import psycopg
 from psycopg.rows import dict_row
 
-from src.types import BacktestResult, EventItem, ReportItem, Security
+from src.types import BacktestResult, CitationItem, EventItem, ReportItem, Security
 
 
-def _chunks(seq: list[tuple[Any, ...]], size: int = 1000) -> Iterator[list[tuple[Any, ...]]]:
+def _chunks(seq: list[Any], size: int = 1000) -> Iterator[list[Any]]:
     for i in range(0, len(seq), size):
         yield seq[i : i + size]
 
@@ -157,48 +158,85 @@ class NeonRepository:
         if prices.empty:
             return
 
-        rows: list[tuple[Any, ...]] = []
-        for _, r in prices.iterrows():
-            sec_uuid = security_uuid_map.get(r["security_id"])
-            if not sec_uuid:
-                continue
-            rows.append(
-                (
-                    sec_uuid,
-                    r["trade_date"],
-                    float(r["open_raw"]),
-                    float(r["high_raw"]),
-                    float(r["low_raw"]),
-                    float(r["close_raw"]),
-                    int(r["volume"]),
-                    float(r.get("adjusted_close", r["close_raw"])),
-                    float(r.get("adjustment_factor", 1.0)),
-                    r.get("source", "unknown"),
-                )
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TEMP TABLE tmp_prices_daily_stage (
+                    security_id UUID NOT NULL,
+                    trade_date DATE NOT NULL,
+                    open_raw NUMERIC(18, 6) NOT NULL,
+                    high_raw NUMERIC(18, 6) NOT NULL,
+                    low_raw NUMERIC(18, 6) NOT NULL,
+                    close_raw NUMERIC(18, 6) NOT NULL,
+                    volume BIGINT,
+                    adjusted_close NUMERIC(18, 6),
+                    adjustment_factor NUMERIC(18, 8) NOT NULL,
+                    source TEXT NOT NULL
+                ) ON COMMIT DROP
+                """
             )
 
-        with self._conn() as conn, conn.cursor() as cur:
-            for batch in _chunks(rows):
-                cur.executemany(
-                    """
-                    INSERT INTO prices_daily (
-                        security_id, trade_date, open_raw, high_raw, low_raw, close_raw,
-                        volume, adjusted_close, adjustment_factor, source
+            has_rows = False
+            with cur.copy(
+                """
+                COPY tmp_prices_daily_stage (
+                    security_id, trade_date, open_raw, high_raw, low_raw, close_raw,
+                    volume, adjusted_close, adjustment_factor, source
+                ) FROM STDIN
+                """
+            ) as copy:
+                for row in prices.itertuples(index=False):
+                    sec_uuid = security_uuid_map.get(getattr(row, "security_id"))
+                    if not sec_uuid:
+                        continue
+
+                    close_raw = float(getattr(row, "close_raw"))
+                    adjusted_close = getattr(row, "adjusted_close", close_raw)
+                    adjustment_factor = getattr(row, "adjustment_factor", 1.0)
+                    source = getattr(row, "source", "unknown")
+
+                    copy.write_row(
+                        (
+                            sec_uuid,
+                            getattr(row, "trade_date"),
+                            float(getattr(row, "open_raw")),
+                            float(getattr(row, "high_raw")),
+                            float(getattr(row, "low_raw")),
+                            close_raw,
+                            int(getattr(row, "volume")),
+                            float(adjusted_close),
+                            float(adjustment_factor),
+                            str(source),
+                        )
                     )
-                    VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (security_id, trade_date)
-                    DO UPDATE SET open_raw = EXCLUDED.open_raw,
-                                  high_raw = EXCLUDED.high_raw,
-                                  low_raw = EXCLUDED.low_raw,
-                                  close_raw = EXCLUDED.close_raw,
-                                  volume = EXCLUDED.volume,
-                                  adjusted_close = EXCLUDED.adjusted_close,
-                                  adjustment_factor = EXCLUDED.adjustment_factor,
-                                  source = EXCLUDED.source,
-                                  retrieved_at = NOW()
-                    """,
-                    batch,
+                    has_rows = True
+
+            if not has_rows:
+                conn.rollback()
+                return
+
+            cur.execute(
+                """
+                INSERT INTO prices_daily (
+                    security_id, trade_date, open_raw, high_raw, low_raw, close_raw,
+                    volume, adjusted_close, adjustment_factor, source
                 )
+                SELECT
+                    security_id, trade_date, open_raw, high_raw, low_raw, close_raw,
+                    volume, adjusted_close, adjustment_factor, source
+                FROM tmp_prices_daily_stage
+                ON CONFLICT (security_id, trade_date)
+                DO UPDATE SET open_raw = EXCLUDED.open_raw,
+                              high_raw = EXCLUDED.high_raw,
+                              low_raw = EXCLUDED.low_raw,
+                              close_raw = EXCLUDED.close_raw,
+                              volume = EXCLUDED.volume,
+                              adjusted_close = EXCLUDED.adjusted_close,
+                              adjustment_factor = EXCLUDED.adjustment_factor,
+                              source = EXCLUDED.source,
+                              retrieved_at = NOW()
+                """
+            )
             conn.commit()
 
     def upsert_fx(self, fx_df: pd.DataFrame) -> None:
@@ -249,7 +287,11 @@ class NeonRepository:
                     bool(r["exclusion_flag"]),
                     r["confidence"],
                     int(r["market_rank"]),
-                    json.dumps({}),
+                    json.dumps(
+                        {
+                            "edge_score": float(r.get("edge_score", 0.0)),
+                        }
+                    ),
                 )
             )
 
@@ -349,6 +391,79 @@ class NeonRepository:
             )
             conn.commit()
 
+    def fetch_signals_for_diagnostics(
+        self,
+        as_of_date: date,
+        lookback_days: int = 730,
+    ) -> pd.DataFrame:
+        columns = ["security_id", "as_of_date"]
+        lookback = max(1, int(lookback_days))
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    sec.security_id,
+                    s.as_of_date
+                FROM signals s
+                JOIN securities sec
+                  ON sec.id = s.security_id
+                JOIN runs r
+                  ON r.id = s.run_id
+                WHERE s.is_signal = TRUE
+                  AND r.run_type = 'weekly'
+                  AND s.as_of_date >= %s::date - (%s::int * INTERVAL '1 day')
+                  AND s.as_of_date <= %s::date
+                ORDER BY s.as_of_date ASC
+                """,
+                (as_of_date, lookback, as_of_date),
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            return pd.DataFrame(columns=columns)
+
+        return pd.DataFrame(rows).reindex(columns=columns)
+
+    def upsert_signal_diagnostics_weekly(
+        self,
+        run_id: str,
+        diagnostics: list[dict[str, Any]],
+    ) -> None:
+        if not diagnostics:
+            return
+
+        rows: list[tuple[Any, ...]] = []
+        for d in diagnostics:
+            rows.append(
+                (
+                    run_id,
+                    int(d["horizon_days"]),
+                    float(d["hit_rate"]),
+                    float(d["median_return"]) if d.get("median_return") is not None else None,
+                    float(d["p10_return"]) if d.get("p10_return") is not None else None,
+                    float(d["p90_return"]) if d.get("p90_return") is not None else None,
+                    int(d.get("sample_size", 0)),
+                )
+            )
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO signal_diagnostics_weekly (
+                    run_id, horizon_days, hit_rate, median_return, p10_return, p90_return, sample_size
+                )
+                VALUES (%s::uuid, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (run_id, horizon_days)
+                DO UPDATE SET hit_rate = EXCLUDED.hit_rate,
+                              median_return = EXCLUDED.median_return,
+                              p10_return = EXCLUDED.p10_return,
+                              p90_return = EXCLUDED.p90_return,
+                              sample_size = EXCLUDED.sample_size
+                """,
+                rows,
+            )
+            conn.commit()
+
     def _ensure_document_version(self, cur: psycopg.Cursor, doc_version_id: str, source_url: str | None = None) -> None:
         ext_doc_id = doc_version_id
         src = source_url or "https://example.com/evidence"
@@ -424,6 +539,152 @@ class NeonRepository:
                 )
             conn.commit()
 
+    def get_evidence_stats(
+        self,
+        security_ids: list[str],
+        lookback_days: int = 30,
+    ) -> pd.DataFrame:
+        columns = [
+            "security_id",
+            "primary_source_count",
+            "has_key_numbers",
+            "has_major_contradiction",
+            "catalyst_bonus",
+        ]
+        if not security_ids:
+            return pd.DataFrame(columns=columns)
+
+        lookback = max(1, int(lookback_days))
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH target AS (
+                    SELECT id, security_id
+                    FROM securities
+                    WHERE security_id = ANY(%s)
+                ),
+                citation_stats AS (
+                    SELECT
+                        r.security_id,
+                        COUNT(DISTINCT c.doc_version_id) AS primary_source_count,
+                        BOOL_OR(c.quote_text ~ '[0-9]') AS has_key_numbers
+                    FROM reports r
+                    JOIN report_claims rc
+                      ON rc.report_id = r.id
+                    JOIN citations c
+                      ON c.report_id = rc.report_id
+                     AND c.claim_id = rc.claim_id
+                    WHERE r.security_id IN (SELECT id FROM target)
+                      AND r.created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                    GROUP BY r.security_id
+                ),
+                contradiction_stats AS (
+                    SELECT
+                        e.security_id,
+                        BOOL_OR(
+                            e.title ~* '(下方修正|訂正|撤回)'
+                            OR COALESCE(e.summary, '') ~* '(下方修正|訂正|撤回)'
+                        ) AS has_major_contradiction
+                    FROM events e
+                    WHERE e.security_id IN (SELECT id FROM target)
+                      AND e.event_time >= NOW() - (%s::int * INTERVAL '1 day')
+                    GROUP BY e.security_id
+                ),
+                catalyst_stats AS (
+                    SELECT
+                        e.security_id,
+                        COUNT(*) FILTER (WHERE e.importance = 'high') AS high_count,
+                        COUNT(*) FILTER (WHERE e.importance = 'medium') AS medium_count
+                    FROM events e
+                    WHERE e.security_id IN (SELECT id FROM target)
+                      AND e.event_time >= NOW() - (%s::int * INTERVAL '1 day')
+                    GROUP BY e.security_id
+                )
+                SELECT
+                    t.security_id,
+                    COALESCE(cs.primary_source_count, 0)::int AS primary_source_count,
+                    COALESCE(cs.has_key_numbers, FALSE) AS has_key_numbers,
+                    COALESCE(ct.has_major_contradiction, FALSE) AS has_major_contradiction,
+                    LEAST(
+                        COALESCE(cat.high_count, 0) * 0.15 + COALESCE(cat.medium_count, 0) * 0.05,
+                        0.30
+                    )::double precision AS catalyst_bonus
+                FROM target t
+                LEFT JOIN citation_stats cs
+                    ON cs.security_id = t.id
+                LEFT JOIN contradiction_stats ct
+                    ON ct.security_id = t.id
+                LEFT JOIN catalyst_stats cat
+                    ON cat.security_id = t.id
+                ORDER BY t.security_id
+                """,
+                (security_ids, lookback, lookback, lookback),
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            return pd.DataFrame(columns=columns)
+
+        return pd.DataFrame(rows).reindex(columns=columns)
+
+    def get_recent_citations_by_security(
+        self,
+        security_ids: list[str],
+        lookback_days: int = 30,
+        per_security_limit: int = 3,
+    ) -> dict[str, list[CitationItem]]:
+        if not security_ids:
+            return {}
+
+        lookback = max(1, int(lookback_days))
+        limit = max(1, int(per_security_limit))
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH target AS (
+                    SELECT id, security_id
+                    FROM securities
+                    WHERE security_id = ANY(%s)
+                ),
+                ranked AS (
+                    SELECT
+                        t.security_id,
+                        c.claim_id,
+                        c.doc_version_id::text AS doc_version_id,
+                        c.page_ref,
+                        c.quote_text,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY t.id
+                            ORDER BY r.created_at DESC, c.created_at DESC
+                        ) AS row_num
+                    FROM target t
+                    JOIN reports r
+                      ON r.security_id = t.id
+                    JOIN citations c
+                      ON c.report_id = r.id
+                    WHERE r.created_at >= NOW() - (%s::int * INTERVAL '1 day')
+                )
+                SELECT security_id, claim_id, doc_version_id, page_ref, quote_text
+                FROM ranked
+                WHERE row_num <= %s
+                ORDER BY security_id, row_num
+                """,
+                (security_ids, lookback, limit),
+            )
+            rows = cur.fetchall()
+
+        result: dict[str, list[CitationItem]] = {}
+        for row in rows:
+            result.setdefault(row["security_id"], []).append(
+                CitationItem(
+                    claim_id=row["claim_id"],
+                    doc_version_id=row["doc_version_id"],
+                    page_ref=row["page_ref"],
+                    quote_text=row["quote_text"],
+                )
+            )
+        return result
+
     def insert_report(self, run_id: str, report: ReportItem, security_uuid_map: dict[str, str]) -> str:
         sec_uuid = security_uuid_map.get(report.security_id) if report.security_id else None
         with self._conn() as conn, conn.cursor() as cur:
@@ -482,6 +743,107 @@ class NeonRepository:
 
             conn.commit()
         return report_id
+
+    def insert_reports_bulk(
+        self,
+        run_id: str,
+        reports: list[ReportItem],
+        security_uuid_map: dict[str, str],
+        batch_size: int = 10,
+    ) -> list[str]:
+        if not reports:
+            return []
+
+        report_ids: list[str] = []
+        with self._conn() as conn, conn.cursor() as cur:
+            for batch in _chunks(reports, size=batch_size):
+                current_ids = [str(uuid4()) for _ in batch]
+                report_rows: list[tuple[Any, ...]] = []
+                claim_rows: list[tuple[Any, ...]] = []
+                citation_rows: list[tuple[Any, ...]] = []
+                doc_sources: dict[str, str | None] = {}
+
+                for report_id, report in zip(current_ids, batch, strict=True):
+                    sec_uuid = security_uuid_map.get(report.security_id) if report.security_id else None
+                    report_rows.append(
+                        (
+                            report_id,
+                            run_id,
+                            sec_uuid,
+                            report.report_type,
+                            report.title,
+                            report.body_md,
+                            report.conclusion,
+                            report.falsification_conditions,
+                            report.confidence,
+                        )
+                    )
+
+                    for claim in report.claims:
+                        claim_rows.append(
+                            (
+                                report_id,
+                                claim["claim_id"],
+                                claim["claim_text"],
+                                claim.get("status", "supported"),
+                            )
+                        )
+
+                    for citation in report.citations:
+                        if citation.doc_version_id not in doc_sources:
+                            doc_sources[citation.doc_version_id] = None
+                        citation_rows.append(
+                            (
+                                report_id,
+                                citation.claim_id,
+                                citation.doc_version_id,
+                                citation.page_ref,
+                                citation.quote_text,
+                                json.dumps({"source": "worker"}),
+                            )
+                        )
+
+                for doc_version_id, source_url in doc_sources.items():
+                    self._ensure_document_version(cur, doc_version_id, source_url)
+
+                cur.executemany(
+                    """
+                    INSERT INTO reports (
+                        id, run_id, security_id, report_type, title, body_md,
+                        conclusion, falsification_conditions, confidence
+                    )
+                    VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s)
+                    """,
+                    report_rows,
+                )
+
+                if claim_rows:
+                    cur.executemany(
+                        """
+                        INSERT INTO report_claims (report_id, claim_id, claim_text, claim_type, status)
+                        VALUES (%s::uuid, %s, %s, 'important', %s)
+                        ON CONFLICT (report_id, claim_id)
+                        DO UPDATE SET claim_text = EXCLUDED.claim_text,
+                                      status = EXCLUDED.status
+                        """,
+                        claim_rows,
+                    )
+
+                if citation_rows:
+                    cur.executemany(
+                        """
+                        INSERT INTO citations (
+                            report_id, claim_id, doc_version_id, page_ref, quote_text, locator
+                        )
+                        VALUES (%s::uuid, %s, %s::uuid, %s, %s, %s::jsonb)
+                        """,
+                        citation_rows,
+                    )
+
+                conn.commit()
+                report_ids.extend(current_ids)
+
+        return report_ids
 
     def create_backtest_run(
         self,

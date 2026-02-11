@@ -44,6 +44,10 @@ cp .env.example .env
 2. スキーマ適用（Neon）
 
 ```bash
+# 推奨: docker compose 経由 (psql のローカル導入不要)
+docker compose --profile setup run --rm db-bootstrap
+
+# 代替: ラッパースクリプト（psql があればローカル実行、なければ compose にフォールバック）
 bash scripts/bootstrap.sh
 ```
 

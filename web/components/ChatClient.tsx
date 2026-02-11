@@ -11,6 +11,8 @@ type AnswerPayload = {
 
 export function ChatClient() {
   const [question, setQuestion] = useState("");
+  const [securityId, setSecurityId] = useState("");
+  const [periodDays, setPeriodDays] = useState("90");
   const [sessionId, setSessionId] = useState<string | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [payload, setPayload] = useState<AnswerPayload | null>(null);
@@ -26,7 +28,12 @@ export function ChatClient() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, sessionId })
+        body: JSON.stringify({
+          question,
+          sessionId,
+          securityId: securityId.trim() || null,
+          periodDays: periodDays.trim() || null
+        })
       });
       const json = await res.json();
       if (!res.ok) {
@@ -52,6 +59,26 @@ export function ChatClient() {
           onChange={(e) => setQuestion(e.target.value)}
           placeholder="例: JP:1301 の最新結論と反証条件を教えて"
         />
+        <div className="grid two" style={{ gap: 8 }}>
+          <div className="grid" style={{ gap: 4 }}>
+            <label htmlFor="securityId">銘柄（任意）</label>
+            <input
+              id="securityId"
+              value={securityId}
+              onChange={(e) => setSecurityId(e.target.value)}
+              placeholder="例: US:119"
+            />
+          </div>
+          <div className="grid" style={{ gap: 4 }}>
+            <label htmlFor="periodDays">期間日数（任意）</label>
+            <input
+              id="periodDays"
+              value={periodDays}
+              onChange={(e) => setPeriodDays(e.target.value)}
+              placeholder="例: 90"
+            />
+          </div>
+        </div>
         <div style={{ display: "flex", gap: 8 }}>
           <button disabled={loading} onClick={submit}>
             {loading ? "処理中..." : "送信"}
@@ -63,7 +90,7 @@ export function ChatClient() {
 
       {payload ? (
         <div className="card grid">
-          <h3>回答（差分表示）</h3>
+          <h3>回答（構造化）</h3>
           <pre>{payload.answerAfter}</pre>
           <h4>引用</h4>
           {payload.citations.length === 0 ? (

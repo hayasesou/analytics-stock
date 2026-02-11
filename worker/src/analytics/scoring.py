@@ -92,6 +92,17 @@ def score_securities(
 
     df["confidence"] = np.where(high_mask, "High", np.where(medium_mask, "Medium", "Low"))
 
+    # Shadow metric for live observation only. It must not affect ranking or signal logic.
+    df["edge_score"] = (
+        df["quality"] * 0.28
+        + df["growth"] * 0.22
+        + df["value"] * 0.16
+        + df["momentum"] * 0.24
+        + df["catalyst"] * 0.10
+        - df["missing_ratio"].fillna(0.0) * 40.0
+        - df["liquidity_flag"].astype(float) * 8.0
+    ).clip(lower=0.0, upper=100.0)
+
     df["market_rank"] = df.groupby("market")["combined_score"].rank(method="dense", ascending=False).astype(int)
 
     columns = [
@@ -108,6 +119,7 @@ def score_securities(
         "liquidity_flag",
         "exclusion_flag",
         "confidence",
+        "edge_score",
         "market_rank",
     ]
 

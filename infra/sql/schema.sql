@@ -287,6 +287,21 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS signal_diagnostics_weekly (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id UUID NOT NULL REFERENCES runs(id),
+  horizon_days INTEGER NOT NULL CHECK (horizon_days IN (5, 20, 60)),
+  hit_rate NUMERIC(10, 6) NOT NULL,
+  median_return NUMERIC(10, 6),
+  p10_return NUMERIC(10, 6),
+  p90_return NUMERIC(10, 6),
+  sample_size INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (run_id, horizon_days)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_diag_run ON signal_diagnostics_weekly (run_id, horizon_days);
+
 CREATE TABLE IF NOT EXISTS chat_messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   session_id UUID NOT NULL REFERENCES chat_sessions(id),
