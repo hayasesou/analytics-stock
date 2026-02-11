@@ -12,6 +12,17 @@ import {
   WeeklyActionData
 } from "@/lib/types";
 
+function isUndefinedRelationError(error: unknown, relation: string): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as { code?: string; message?: string };
+  if (candidate.code === "42P01") {
+    return true;
+  }
+  return typeof candidate.message === "string" && candidate.message.includes(`relation "${relation}" does not exist`);
+}
+
 function decodeSecurityId(raw: string): string {
   try {
     return decodeURIComponent(raw);
@@ -467,27 +478,41 @@ export async function fetchWeeklyActionData(): Promise<WeeklyActionData> {
     limit 1
   `;
 
-  const diagnosticRows = await sql<
-    {
-      horizon_days: number;
-      hit_rate: number;
-      median_return: number | null;
-      p10_return: number | null;
-      p90_return: number | null;
-      sample_size: number;
-    }[]
-  >`
-    select
-      horizon_days,
-      hit_rate,
-      median_return,
-      p10_return,
-      p90_return,
-      sample_size
-    from signal_diagnostics_weekly
-    where run_id = ${latestRunId}::uuid
-    order by horizon_days asc
-  `;
+  let diagnosticRows: {
+    horizon_days: number;
+    hit_rate: number;
+    median_return: number | null;
+    p10_return: number | null;
+    p90_return: number | null;
+    sample_size: number;
+  }[] = [];
+  try {
+    diagnosticRows = await sql<
+      {
+        horizon_days: number;
+        hit_rate: number;
+        median_return: number | null;
+        p10_return: number | null;
+        p90_return: number | null;
+        sample_size: number;
+      }[]
+    >`
+      select
+        horizon_days,
+        hit_rate,
+        median_return,
+        p10_return,
+        p90_return,
+        sample_size
+      from signal_diagnostics_weekly
+      where run_id = ${latestRunId}::uuid
+      order by horizon_days asc
+    `;
+  } catch (error) {
+    if (!isUndefinedRelationError(error, "signal_diagnostics_weekly")) {
+      throw error;
+    }
+  }
 
   return {
     latestRunId,
