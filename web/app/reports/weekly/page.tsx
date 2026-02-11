@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { fetchWeeklyActionData, fetchWeeklySummary } from "@/lib/repository";
+import type { WeeklyActionData } from "@/lib/types";
 
 function formatJst(ts: string): string {
   const d = new Date(ts);
@@ -35,12 +36,41 @@ function pctNullable(v: number | null): string {
 }
 
 export default async function WeeklySummaryPage() {
-  const [report, actionData] = await Promise.all([fetchWeeklySummary(), fetchWeeklyActionData()]);
+  const emptyActionData: WeeklyActionData = {
+    latestRunId: null,
+    previousRunId: null,
+    highConfidenceTop10: [],
+    liquidityChanges: [],
+    strictMetric: null,
+    signalDiagnostics: []
+  };
+
+  const [reportResult, actionDataResult] = await Promise.allSettled([
+    fetchWeeklySummary(),
+    fetchWeeklyActionData()
+  ]);
+
+  const report = reportResult.status === "fulfilled" ? reportResult.value : null;
+  const actionData = actionDataResult.status === "fulfilled" ? actionDataResult.value : emptyActionData;
+  const reportError = reportResult.status === "rejected" ? reportResult.reason : null;
+  const actionDataError = actionDataResult.status === "rejected" ? actionDataResult.reason : null;
+  const hasPartialError = Boolean(reportError) || Boolean(actionDataError);
+  const partialErrorMessage = [
+    reportError instanceof Error ? `weekly summary: ${reportError.message}` : null,
+    actionDataError instanceof Error ? `weekly actions: ${actionDataError.message}` : null
+  ]
+    .filter(Boolean)
+    .join(" / ");
 
   return (
     <div className="grid" style={{ gap: 12 }}>
       <div className="card">
         <h1>週間サマリ</h1>
+        {hasPartialError ? (
+          <p style={{ color: "#9a3412", marginBottom: 10 }}>
+            一部データの取得に失敗しました。{partialErrorMessage || "詳細はサーバーログを確認してください。"}
+          </p>
+        ) : null}
         {!report ? (
           <p>週間サマリがまだ生成されていません。</p>
         ) : (
