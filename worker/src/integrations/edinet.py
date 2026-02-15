@@ -4,6 +4,8 @@ import requests
 
 
 class EdinetClient:
+    DOCUMENTS_URL = "https://api.edinet-fsa.go.jp/api/v2/documents.json"
+
     def __init__(self, api_key: str | None):
         self.api_key = api_key
 
@@ -18,3 +20,16 @@ class EdinetClient:
         resp = requests.get(endpoint, params=query, timeout=10)
         resp.raise_for_status()
         return resp.json()
+
+    def fetch_documents_list(self, date_yyyy_mm_dd: str) -> list[dict]:
+        payload = self.fetch_documents(
+            self.DOCUMENTS_URL,
+            params={
+                "date": date_yyyy_mm_dd,
+                "type": 2,
+            },
+        )
+        rows = payload.get("results")
+        if not isinstance(rows, list):
+            raise RuntimeError("EDINET documents response missing results[]")
+        return [r for r in rows if isinstance(r, dict)]

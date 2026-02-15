@@ -756,6 +756,65 @@ export async function fetchDailyEvents(): Promise<EventRecord[]> {
   }));
 }
 
+export async function fetchLatestDailyEvents(limit = 10): Promise<EventRecord[]> {
+  const sql = getSql();
+  const targetLimit = clampLookupLimit(limit);
+
+  const rows = await sql<
+    {
+      id: string;
+      importance: "high" | "medium" | "low";
+      event_type: string;
+      event_time: string;
+      title: string;
+      summary: string;
+      source_url: string | null;
+    }[]
+  >`
+    with ranked as (
+      select
+        e.id::text as id,
+        e.importance,
+        e.event_type,
+        e.event_time::text as event_time,
+        e.title,
+        e.summary,
+        e.source_url,
+        row_number() over (
+          partition by coalesce(e.source_url, e.title), e.event_type, e.event_time
+          order by e.created_at desc, e.id desc
+        ) as rn
+      from events e
+      join runs r on r.id = e.run_id
+      where r.run_type = 'daily'
+        and r.status = 'success'
+        and e.summary not ilike 'Mock event generated for baseline operation.%'
+    )
+    select
+      id,
+      importance,
+      event_type,
+      event_time,
+      title,
+      summary,
+      source_url
+    from ranked
+    where rn = 1
+    order by event_time desc
+    limit ${targetLimit}
+  `;
+
+  return rows.map((r) => ({
+    id: r.id,
+    importance: r.importance,
+    eventType: r.event_type,
+    eventTime: r.event_time,
+    title: r.title,
+    summary: r.summary,
+    sourceUrl: r.source_url
+  }));
+}
+
 export async function fetchBacktestData(): Promise<{
   metrics: BacktestMetric[];
   curve: BacktestPoint[];

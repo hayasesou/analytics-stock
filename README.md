@@ -82,6 +82,13 @@ docker compose --profile jobs run --rm worker-weekly
   - US: `US:<ticker>`（例: `US:AAPL`）
   - 互換性のため旧 `US:###` 形式も API では許容しています。
 
+## 日次イベント（live 優先）
+
+- `daily` ジョブのイベントは live 優先で取得します。
+  - SEC: `getcurrent` Atom フィード（`SEC_USER_AGENT` 必須）
+  - EDINET: documents list API（`EDINET_API_KEY` 任意）
+- live で1件も取得できない場合はイベントを0件として扱います（mock イベントは生成しません）。
+
 ## LLM 生成（任意）
 
 - 週次の `security_full` レポート本文生成を OpenAI で有効化できます。
