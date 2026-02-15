@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import RuntimeSecrets
+from src.integrations.edinet import EdinetClient
 from src.integrations.jquants import JQuantsClient
 from src.integrations.massive import MassiveClient
 from src.integrations.sec import SecEdgarClient
@@ -18,6 +19,10 @@ JP_UNIVERSE_LIMIT = 60
 US_UNIVERSE_LIMIT = 120
 JP_COMMON_MARKET_KEYWORDS = ("プライム", "スタンダード", "グロース", "内国株式", "Prime", "Standard", "Growth")
 US_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,6}$")
+SEC_HIGH_FORMS = {"8-K", "6-K"}
+SEC_MEDIUM_FORMS = {"10-K", "10-Q", "20-F", "DEF 14A"}
+EDINET_HIGH_KEYWORDS = ("臨時報告書", "大量保有", "公開買付", "自己株券買付")
+EDINET_MEDIUM_KEYWORDS = ("有価証券報告書", "四半期報告書", "半期報告書", "決算")
 
 
 @dataclass
@@ -354,36 +359,180 @@ class HybridDataProvider:
         return pd.DataFrame(rows)
 
     def load_recent_events(self, now: datetime, hours: int = 24) -> list[EventItem]:
-        rng = self._rng()
-        event_types = ["earning", "guidance", "filing", "news"]
-        importance_levels = ["high", "medium", "low"]
-        count = int(rng.integers(8, 20))
+        hours = max(1, int(hours))
+        since = now - timedelta(hours=hours)
+
+        sec_events = self._load_recent_events_sec(since=since, now=now)
+        edinet_events = self._load_recent_events_edinet(since=since, now=now)
+        live_events = sec_events + edinet_events
+        if live_events:
+            deduped: dict[tuple[str, str], EventItem] = {}
+            for event in live_events:
+                source = str(event.source_url or event.title)
+                key = (source, event.event_time.isoformat())
+                existing = deduped.get(key)
+                if existing is None or event.event_time > existing.event_time:
+                    deduped[key] = event
+
+            events = sorted(deduped.values(), key=lambda x: x.event_time, reverse=True)
+            print(
+                f"[provider] recent_events source=live count={len(events)} sec={len(sec_events)} edinet={len(edinet_events)}",
+                flush=True,
+            )
+            return events
+
+        print(
+            f"[provider] recent_events source=live count=0 sec={len(sec_events)} edinet={len(edinet_events)}",
+            flush=True,
+        )
+        return []
+
+    @staticmethod
+    def _event_doc_version_id(source: str, event_time: datetime) -> str:
+        src = str(source or "").strip() or "event"
+        raw = f"{src}:{event_time.isoformat()}"
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
+
+    @staticmethod
+    def _parse_event_time(raw: object) -> datetime | None:
+        if isinstance(raw, datetime):
+            parsed = raw
+        else:
+            text = str(raw or "").strip()
+            if not text:
+                return None
+            normalized = text.replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                    try:
+                        parsed = datetime.strptime(text, fmt)  # noqa: DTZ007
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    return None
+        if parsed.tzinfo is not None:
+            return parsed.astimezone().replace(tzinfo=None)
+        return parsed
+
+    @staticmethod
+    def _importance_from_sec_form(form_type: str) -> str:
+        form = str(form_type or "").strip().upper()
+        if form in SEC_HIGH_FORMS:
+            return "high"
+        if form in SEC_MEDIUM_FORMS:
+            return "medium"
+        return "low"
+
+    @staticmethod
+    def _importance_from_edinet_description(description: str) -> str:
+        desc = str(description or "").strip()
+        if any(keyword in desc for keyword in EDINET_HIGH_KEYWORDS):
+            return "high"
+        if any(keyword in desc for keyword in EDINET_MEDIUM_KEYWORDS):
+            return "medium"
+        return "low"
+
+    def _load_recent_events_sec(self, since: datetime, now: datetime) -> list[EventItem]:
+        sec_client = SecEdgarClient(self.secrets.sec_user_agent)
+        try:
+            rows = sec_client.fetch_current_filings(count=100)
+        except Exception as exc:
+            print(f"[provider] recent_events_error source=sec error={exc}", flush=True)
+            return []
+
         events: list[EventItem] = []
-        for i in range(count):
-            delta_h = int(rng.integers(0, hours))
-            event_time = now - timedelta(hours=delta_h)
-            importance = rng.choice(importance_levels, p=[0.25, 0.45, 0.30])
-            event_kind = str(rng.choice(event_types))
-            title = f"Event {i + 1}: {event_kind}"
-            summary = "Mock event generated for baseline operation. Replace with TDnet/EDINET/SEC ingestion."
-            source_url = f"https://example.com/event/{i + 1}"
-            doc_version_id = self._mock_doc_version_id(source_url, event_time)
+        for row in rows:
+            event_time = self._parse_event_time(row.get("updated"))
+            if event_time is None:
+                continue
+            if event_time < since or event_time > (now + timedelta(hours=2)):
+                continue
+
+            form_type = str(row.get("form_type") or "").strip().upper()
+            company_name = str(row.get("company_name") or "").strip()
+            source_url = str(row.get("source_url") or "").strip() or None
+            title = f"{form_type}: {company_name}" if form_type and company_name else str(row.get("title") or "").strip()
+            if not title:
+                continue
+            summary = str(row.get("summary") or "").strip() or "SEC filing update."
+            doc_version_id = self._event_doc_version_id(source_url or title, event_time)
+
             events.append(
                 EventItem(
-                    event_type=event_kind,
-                    importance=str(importance),
+                    event_type="filing",
+                    importance=self._importance_from_sec_form(form_type),
                     event_time=event_time,
                     title=title,
                     summary=summary,
                     source_url=source_url,
                     security_id=None,
                     doc_version_id=doc_version_id,
+                    metadata={
+                        "source": "sec",
+                        "form_type": form_type or None,
+                    },
                 )
             )
-        events.sort(key=lambda x: x.event_time, reverse=True)
         return events
 
-    @staticmethod
-    def _mock_doc_version_id(source_url: str, event_time: datetime) -> str:
-        raw = f"{source_url}:{event_time.isoformat()}"
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
+    def _load_recent_events_edinet(self, since: datetime, now: datetime) -> list[EventItem]:
+        client = EdinetClient(self.secrets.edinet_api_key)
+        if not client.available():
+            return []
+
+        target_dates = sorted({since.date(), now.date()})
+        events: list[EventItem] = []
+        for target_date in target_dates:
+            try:
+                rows = client.fetch_documents_list(target_date.isoformat())
+            except Exception as exc:
+                print(
+                    f"[provider] recent_events_error source=edinet date={target_date.isoformat()} error={exc}",
+                    flush=True,
+                )
+                continue
+
+            for row in rows:
+                doc_id = str(row.get("docID") or row.get("docId") or "").strip()
+                submit_time_raw = row.get("submitDateTime") or row.get("submitDate")
+                event_time = self._parse_event_time(submit_time_raw)
+                if event_time is None:
+                    continue
+                if event_time < since or event_time > (now + timedelta(hours=2)):
+                    continue
+
+                filer_name = str(row.get("filerName") or row.get("submitterName") or "").strip()
+                doc_desc = str(row.get("docDescription") or row.get("description") or "").strip()
+                if not filer_name and not doc_desc:
+                    continue
+
+                title = " - ".join(part for part in [filer_name, doc_desc] if part)
+                summary = doc_desc or "EDINET filing update."
+                source_url = (
+                    f"https://disclosure2.edinet-fsa.go.jp/WEEK0010.aspx?DocID={doc_id}"
+                    if doc_id
+                    else None
+                )
+                doc_version_id = self._event_doc_version_id(source_url or title, event_time)
+
+                events.append(
+                    EventItem(
+                        event_type="filing",
+                        importance=self._importance_from_edinet_description(doc_desc),
+                        event_time=event_time,
+                        title=title,
+                        summary=summary,
+                        source_url=source_url,
+                        security_id=None,
+                        doc_version_id=doc_version_id,
+                        metadata={
+                            "source": "edinet",
+                            "doc_id": doc_id or None,
+                            "form_code": str(row.get("formCode") or "").strip() or None,
+                        },
+                    )
+                )
+        return events
