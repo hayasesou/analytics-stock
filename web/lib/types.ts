@@ -25,6 +25,13 @@ export type Top50Row = {
   validUntil: string | null;
 };
 
+export type SecurityIdentity = {
+  securityId: string;
+  market: "JP" | "US";
+  ticker: string;
+  name: string;
+};
+
 export type ReportRecord = {
   id: string;
   securityId: string | null;

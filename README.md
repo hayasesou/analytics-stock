@@ -71,6 +71,17 @@ docker compose --profile jobs run --rm worker-weekly
 
 `scripts/` に cron 用ラッパーを配置しています。
 
+## 銘柄マスタ（実企業名）
+
+- `worker` は銘柄マスタを live 優先で取得します。
+  - JP: J-Quants V2 `equities/master`（`JQUANTS_API_KEY` 必須。未設定時のみ `JQUANTS_EMAIL` / `JQUANTS_PASSWORD` の旧認証にフォールバック）
+  - US: Massive `reference/tickers`（`MASSIVE_API_KEY` 任意）または SEC `company_tickers_exchange.json`
+- live 取得に失敗した場合は従来の mock ユニバースにフォールバックします。
+- `security_id` 形式:
+  - JP: `JP:####`（実在4桁コード）
+  - US: `US:<ticker>`（例: `US:AAPL`）
+  - 互換性のため旧 `US:###` 形式も API では許容しています。
+
 ## LLM 生成（任意）
 
 - 週次の `security_full` レポート本文生成を OpenAI で有効化できます。

@@ -7,6 +7,7 @@ import pytest
 
 from src.llm.reporting import (
     build_weekly_summary_report_prompt,
+    generate_weekly_summary_report,
     generate_weekly_summary_report_with_llm,
     parse_weekly_summary_report_llm_payload,
 )
@@ -18,6 +19,8 @@ def _sample_top50() -> pd.DataFrame:
             {
                 "mixed_rank": 1,
                 "security_id": "JP:1301",
+                "ticker": "1301",
+                "name": "極洋",
                 "market": "JP",
                 "combined_score": 71.2,
                 "confidence": "High",
@@ -25,6 +28,8 @@ def _sample_top50() -> pd.DataFrame:
             {
                 "mixed_rank": 2,
                 "security_id": "US:119",
+                "ticker": "AAPL",
+                "name": "Apple Inc.",
                 "market": "US",
                 "combined_score": 69.8,
                 "confidence": "Medium",
@@ -53,8 +58,20 @@ def test_build_weekly_summary_report_prompt_contains_run_context() -> None:
     )
     assert "Run ID: run-123" in prompt
     assert "Top50 count: 2" in prompt
-    assert "security=JP:1301" in prompt
+    assert "security=1301 / 極洋 (JP:1301)" in prompt
     assert '"claim_id":"C1"' in prompt
+
+
+def test_generate_weekly_summary_report_includes_company_name_in_top10_preview() -> None:
+    report = generate_weekly_summary_report(
+        run_id="run-123",
+        as_of=datetime(2026, 2, 11, 10, 0, 0),
+        top50=_sample_top50(),
+        events=_sample_events(),
+    )
+    assert "| rank | security | market | score | confidence |" in report.body_md
+    assert "1301 / 極洋 (JP:1301)" in report.body_md
+    assert "AAPL / Apple Inc. (US:119)" in report.body_md
 
 
 def test_parse_weekly_summary_report_llm_payload_requires_fields() -> None:

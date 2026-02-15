@@ -19,6 +19,7 @@ class RuntimeSecrets:
     r2_bucket_evidence: str | None
     r2_bucket_data: str | None
     r2_endpoint: str | None
+    jquants_api_key: str | None
     jquants_email: str | None
     jquants_password: str | None
     massive_api_key: str | None
@@ -65,6 +66,7 @@ def load_runtime_secrets() -> RuntimeSecrets:
         r2_bucket_evidence=_env("R2_BUCKET_EVIDENCE"),
         r2_bucket_data=_env("R2_BUCKET_DATA"),
         r2_endpoint=_env("R2_ENDPOINT"),
+        jquants_api_key=_env("JQUANTS_API_KEY"),
         jquants_email=_env("JQUANTS_EMAIL"),
         jquants_password=_env("JQUANTS_PASSWORD"),
         massive_api_key=_env("MASSIVE_API_KEY"),

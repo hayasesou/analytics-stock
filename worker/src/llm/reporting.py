@@ -91,6 +91,33 @@ def _score_table(row: pd.Series) -> str:
     return "\n".join(lines)
 
 
+def _row_text(row: pd.Series, key: str, default: str = "") -> str:
+    value = row.get(key, default)
+    if value is None:
+        return default
+    if isinstance(value, float) and pd.isna(value):
+        return default
+    text = str(value).strip()
+    return text or default
+
+
+def _security_label(row: pd.Series) -> str:
+    security_id = _row_text(row, "security_id", "-")
+    ticker = _row_text(row, "ticker")
+    name = _row_text(row, "name")
+    if ticker and name:
+        return f"{ticker} / {name} ({security_id})"
+    if name:
+        return f"{name} ({security_id})"
+    if ticker:
+        return f"{ticker} ({security_id})"
+    return security_id
+
+
+def _md_cell(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
 def _remap_citations(raw_citations: list[CitationItem], claim_ids: list[str]) -> list[CitationItem]:
     remapped: list[CitationItem] = []
     for claim_id, citation in zip(claim_ids, raw_citations, strict=False):
@@ -199,7 +226,10 @@ def build_weekly_summary_report_prompt(
     top_preview = top50.head(10)
     high_med_count = sum(1 for e in events if e.get("importance") in {"high", "medium"})
     top_lines = [
-        f"- rank={int(row['mixed_rank'])} security={row['security_id']} market={row['market']} score={float(row['combined_score']):.2f} confidence={row['confidence']}"
+        (
+            f"- rank={int(row['mixed_rank'])} security={_security_label(row)} "
+            f"market={row['market']} score={float(row['combined_score']):.2f} confidence={row['confidence']}"
+        )
         for _, row in top_preview.iterrows()
     ]
     if not top_lines:
@@ -439,13 +469,14 @@ def generate_weekly_summary_report(
         f"- High/Med イベント数: {sum(1 for e in events if e['importance'] in {'high', 'medium'})}",
         "",
         "## Top10 プレビュー",
-        "| rank | security_id | market | score | confidence |",
+        "| rank | security | market | score | confidence |",
         "|---:|---|---|---:|---|",
     ]
 
     for _, row in top_preview.iterrows():
+        security = _md_cell(_security_label(row))
         lines.append(
-            f"| {int(row['mixed_rank'])} | {row['security_id']} | {row['market']} | {row['combined_score']:.2f} | {row['confidence']} |"
+            f"| {int(row['mixed_rank'])} | {security} | {row['market']} | {row['combined_score']:.2f} | {row['confidence']} |"
         )
 
     lines.append("")

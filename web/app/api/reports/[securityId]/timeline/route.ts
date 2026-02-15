@@ -4,7 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { fetchSecurityTimeline } from "@/lib/repository";
 
-const SECURITY_ID_RE = /^(JP:\d{4}|US:\d+)$/;
+const SECURITY_ID_RE = /^(JP:\d{4}|US:(?:\d+|[A-Z][A-Z0-9.-]{0,6}))$/;
 
 function decodeSecurityId(raw: string): string {
   try {

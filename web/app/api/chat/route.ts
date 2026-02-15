@@ -6,11 +6,13 @@ import {
   appendChatCitation,
   appendChatMessage,
   createChatSessionIfNeeded,
+  fetchSecurityIdentity,
   fetchLatestAssistantAnswer,
   searchEvidenceFromReports
 } from "@/lib/repository";
+import type { SecurityIdentity } from "@/lib/types";
 
-const SECURITY_ID_RE = /^(JP:\d{4}|US:\d+)$/;
+const SECURITY_ID_RE = /^(JP:\d{4}|US:(?:\d+|[A-Z][A-Z0-9.-]{0,6}))$/;
 
 function parsePeriodDays(raw: unknown): number | null {
   if (raw == null || raw === "") {
@@ -26,8 +28,18 @@ function parsePeriodDays(raw: unknown): number | null {
 function buildAnswer(
   question: string,
   evidence: Awaited<ReturnType<typeof searchEvidenceFromReports>>,
-  options: { securityId?: string | null; periodDays?: number | null }
+  options: { securityId?: string | null; periodDays?: number | null; resolvedSecurity?: SecurityIdentity | null }
 ) {
+  const securitySummary = options.resolvedSecurity
+    ? `${options.resolvedSecurity.securityId} / ${options.resolvedSecurity.ticker} / ${options.resolvedSecurity.name} (${options.resolvedSecurity.market})`
+    : null;
+  const targetLabel = options.resolvedSecurity
+    ? `${options.resolvedSecurity.securityId} (${options.resolvedSecurity.ticker} / ${options.resolvedSecurity.name})`
+    : options.securityId ?? null;
+  const securityLines = securitySummary
+    ? ["## 対象銘柄", securitySummary, ""]
+    : [];
+
   if (evidence.length === 0) {
     const conclusion = "既存引用に一致する根拠が不足しているため、現時点の結論は仮説扱いです。";
     const roots = [
@@ -37,9 +49,9 @@ function buildAnswer(
     ];
     const counter = "一次情報で前提と逆の事実が確認された場合、この仮説は無効です。";
     const actions = [
-      options.securityId
-        ? `${options.securityId} の最新開示を再取得し、数値付き citation を3件以上確保する。`
-        : "対象銘柄（例: JP:1301 / US:119）を指定して再質問する。",
+      targetLabel
+        ? `${targetLabel} の最新開示を再取得し、数値付き citation を3件以上確保する。`
+        : "対象銘柄（例: JP:1301 / US:AAPL）を指定して再質問する。",
       options.periodDays
         ? `過去${options.periodDays}日での根拠に限定して再判定する。`
         : "期間（例: 30日 / 90日）を指定して再質問する。"
@@ -50,6 +62,7 @@ function buildAnswer(
         "## 結論",
         conclusion,
         "",
+        ...securityLines,
         "## 根拠3点",
         `1. ${roots[0]}`,
         `2. ${roots[1]}`,
@@ -81,8 +94,8 @@ function buildAnswer(
   const conclusion = top.report.conclusion ?? "監視継続";
   const counter =
     top.report.falsificationConditions ?? "一次情報との不一致、または前提条件の崩れを確認した場合。";
-  const action1 = options.securityId
-    ? `${options.securityId} の次回開示時に同一フォーマットで再評価する。`
+  const action1 = targetLabel
+    ? `${targetLabel} の次回開示時に同一フォーマットで再評価する。`
     : "対象銘柄を指定して、結論の対象を明確にする。";
   const action2 = options.periodDays
     ? `過去${options.periodDays}日で citation 更新有無を確認する。`
@@ -92,6 +105,7 @@ function buildAnswer(
     answer: [
       `質問: ${question}`,
       "",
+      ...securityLines,
       "## 結論",
       conclusion,
       "",
@@ -125,7 +139,7 @@ export async function POST(req: NextRequest) {
     const securityId = securityIdRaw ? securityIdRaw : null;
     if (securityId && !SECURITY_ID_RE.test(securityId)) {
       return NextResponse.json(
-        { error: "securityId must be JP:#### or US:### format" },
+        { error: "securityId must be JP:#### or US:<ticker> (legacy US:### also allowed) format" },
         { status: 400 }
       );
     }
@@ -134,6 +148,13 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         { error: "periodDays must be integer between 1 and 3650" },
         { status: 400 }
+      );
+    }
+    const resolvedSecurity = securityId ? await fetchSecurityIdentity(securityId) : null;
+    if (securityId && !resolvedSecurity) {
+      return NextResponse.json(
+        { error: `securityId not found: ${securityId}` },
+        { status: 404 }
       );
     }
 
@@ -152,7 +173,8 @@ export async function POST(req: NextRequest) {
     });
     const built = buildAnswer(question, evidence, {
       securityId,
-      periodDays
+      periodDays,
+      resolvedSecurity
     });
 
     const assistantMessageId = await appendChatMessage({
@@ -181,7 +203,8 @@ export async function POST(req: NextRequest) {
       sessionId,
       answerBefore: previous,
       answerAfter: built.answer,
-      citations: built.citations
+      citations: built.citations,
+      resolvedSecurity
     });
   } catch (error) {
     return NextResponse.json(

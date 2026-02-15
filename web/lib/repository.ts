@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 
 import { getSql } from "@/lib/db";
-import {
+import type {
   BacktestMetric,
   BacktestPoint,
   CitationRecord,
   EventRecord,
   ReportRecord,
+  SecurityIdentity,
   SecurityTimelineData,
   Top50Row,
   WeeklyActionData
@@ -36,6 +37,35 @@ function clampLookbackDays(days: number): number {
     return 180;
   }
   return Math.min(3650, Math.max(1, Math.trunc(days)));
+}
+
+function clampLookupLimit(limit: number): number {
+  if (!Number.isFinite(limit)) {
+    return 5;
+  }
+  return Math.min(20, Math.max(1, Math.trunc(limit)));
+}
+
+function mapSecurityIdentityRow(row: {
+  security_id: string;
+  market: "JP" | "US";
+  ticker: string;
+  name: string;
+}): SecurityIdentity {
+  return {
+    securityId: row.security_id,
+    market: row.market,
+    ticker: row.ticker,
+    name: row.name
+  };
+}
+
+function isLegacyMockSecurity(row: { market: "JP" | "US"; name: string }): boolean {
+  const name = (row.name ?? "").trim();
+  if (row.market === "JP") {
+    return /^JP Corp \d{4}$/.test(name);
+  }
+  return /^US Holdings \d+$/.test(name);
 }
 
 export async function latestRunId(runType: "weekly" | "daily"): Promise<string | null> {
@@ -166,6 +196,96 @@ export async function fetchTop50(runId?: string): Promise<Top50Row[]> {
   }));
 }
 
+export async function fetchSecurityIdentity(securityId: string): Promise<SecurityIdentity | null> {
+  const sql = getSql();
+  const normalizedSecurityId = decodeSecurityId(securityId).trim();
+  if (!normalizedSecurityId) {
+    return null;
+  }
+
+  const rows = await sql<
+    {
+      security_id: string;
+      market: "JP" | "US";
+      ticker: string;
+      name: string;
+    }[]
+  >`
+    select
+      security_id,
+      market,
+      ticker,
+      coalesce(name, security_id) as name
+    from securities
+    where security_id = ${normalizedSecurityId}
+    limit 1
+  `;
+  const row = rows[0];
+  if (!row || isLegacyMockSecurity({ market: row.market, name: row.name })) {
+    return null;
+  }
+  return mapSecurityIdentityRow(row);
+}
+
+export async function resolveSecurityQuery(query: string, limit = 5): Promise<SecurityIdentity[]> {
+  const sql = getSql();
+  const normalizedQuery = decodeSecurityId(query).trim();
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  const queryLike = `%${normalizedQuery}%`;
+  const cappedLimit = clampLookupLimit(limit);
+  const rows = await sql<
+    {
+      security_id: string;
+      market: "JP" | "US";
+      ticker: string;
+      name: string;
+      rank_bucket: number;
+    }[]
+  >`
+    with candidates as (
+      select
+        s.security_id,
+        s.market,
+        s.ticker,
+        coalesce(s.name, s.security_id) as name,
+        case
+          when upper(s.security_id) = upper(${normalizedQuery}) then 0
+          when upper(s.ticker) = upper(${normalizedQuery}) then 1
+          when upper(coalesce(s.name, '')) = upper(${normalizedQuery}) then 2
+          when upper(s.security_id) like upper(${queryLike}) then 3
+          when upper(s.ticker) like upper(${queryLike}) then 4
+          when upper(coalesce(s.name, '')) like upper(${queryLike}) then 5
+          else 99
+        end as rank_bucket
+      from securities s
+      where
+        upper(s.security_id) = upper(${normalizedQuery})
+        or upper(s.ticker) = upper(${normalizedQuery})
+        or upper(coalesce(s.name, '')) = upper(${normalizedQuery})
+        or upper(s.security_id) like upper(${queryLike})
+        or upper(s.ticker) like upper(${queryLike})
+        or upper(coalesce(s.name, '')) like upper(${queryLike})
+    )
+    select
+      security_id,
+      market,
+      ticker,
+      name,
+      rank_bucket
+    from candidates
+    where rank_bucket < 99
+    order by rank_bucket asc, security_id asc
+    limit ${cappedLimit}
+  `;
+
+  return rows
+    .filter((r) => !isLegacyMockSecurity({ market: r.market, name: r.name }))
+    .map((r) => mapSecurityIdentityRow(r));
+}
+
 export async function fetchSecurityTimeline(
   securityId: string,
   days = 180
@@ -174,14 +294,23 @@ export async function fetchSecurityTimeline(
   const normalizedSecurityId = decodeSecurityId(securityId);
   const lookbackDays = clampLookbackDays(days);
 
-  const securityRows = await sql<{ id: string }[]>`
-    select id::text as id
+  const securityRows = await sql<
+    {
+      id: string;
+      market: "JP" | "US";
+      name: string;
+    }[]
+  >`
+    select
+      id::text as id,
+      market,
+      coalesce(name, security_id) as name
     from securities
     where security_id = ${normalizedSecurityId}
     limit 1
   `;
   const security = securityRows[0];
-  if (!security) {
+  if (!security || isLegacyMockSecurity({ market: security.market, name: security.name })) {
     return null;
   }
 
@@ -285,6 +414,8 @@ export async function fetchReportsBySecurity(securityId: string): Promise<Report
     {
       id: string;
       security_id: string | null;
+      market: "JP" | "US";
+      name: string;
       report_type: string;
       title: string;
       body_md: string;
@@ -297,6 +428,8 @@ export async function fetchReportsBySecurity(securityId: string): Promise<Report
     select
       r.id::text,
       s.security_id,
+      s.market,
+      coalesce(s.name, s.security_id) as name,
       r.report_type,
       r.title,
       r.body_md,
@@ -310,7 +443,9 @@ export async function fetchReportsBySecurity(securityId: string): Promise<Report
     order by r.created_at desc
   `;
 
-  return rows.map((r) => ({
+  return rows
+    .filter((r) => !isLegacyMockSecurity({ market: r.market, name: r.name }))
+    .map((r) => ({
     id: r.id,
     securityId: r.security_id,
     reportType: r.report_type,
