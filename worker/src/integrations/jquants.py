@@ -5,6 +5,7 @@ import requests
 
 class JQuantsClient:
     V2_EQ_MASTER_URL = "https://api.jquants.com/v2/equities/master"
+    V2_EQ_BARS_DAILY_URL = "https://api.jquants.com/v2/equities/bars/daily"
     V1_AUTH_USER_URL = "https://api.jquants.com/v1/token/auth_user"
     V1_AUTH_REFRESH_URL = "https://api.jquants.com/v1/token/auth_refresh"
     V1_LISTED_INFO_URL = "https://api.jquants.com/v1/listed/info"
@@ -130,3 +131,38 @@ class JQuantsClient:
         if self.v1_available():
             return self._fetch_listed_info_v1()
         raise RuntimeError("J-Quants credentials are not set (JQUANTS_API_KEY or JQUANTS_EMAIL/JQUANTS_PASSWORD)")
+
+    def fetch_eq_bars_daily(self, code: str, start_date: str, end_date: str) -> list[dict]:
+        """
+        Fetch v2 daily bars for a JP equity code.
+        Args:
+            code: 4桁または5桁銘柄コード
+            start_date: YYYY-MM-DD
+            end_date: YYYY-MM-DD
+        """
+        if not self.v2_available():
+            raise RuntimeError("J-Quants API key is not set")
+
+        params: dict[str, str] = {
+            "code": str(code).strip(),
+            "from": start_date,
+            "to": end_date,
+        }
+        rows: list[dict] = []
+        while True:
+            resp = requests.get(
+                self.V2_EQ_BARS_DAILY_URL,
+                params=params,
+                headers={"x-api-key": str(self.api_key)},
+                timeout=30,
+            )
+            self._raise_for_status(resp, "J-Quants v2 equities/bars/daily")
+            payload = resp.json()
+            data = payload.get("data")
+            if isinstance(data, list):
+                rows.extend([r for r in data if isinstance(r, dict)])
+            pagination_key = str(payload.get("pagination_key") or "").strip()
+            if not pagination_key:
+                break
+            params["pagination_key"] = pagination_key
+        return rows

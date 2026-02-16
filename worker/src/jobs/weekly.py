@@ -234,6 +234,7 @@ def run_weekly() -> str:
         prices = provider.load_price_history(securities, start, now)
         stage_started = _log_stage("load_price_history", stage_started, run_started, extra=f"rows={len(prices)}")
 
+        repo.delete_prices_range(list(sec_map.values()), start.date(), now.date())
         repo.upsert_prices(prices, sec_map)
         stage_started = _log_stage("upsert_prices", stage_started, run_started, extra=f"rows={len(prices)}")
 

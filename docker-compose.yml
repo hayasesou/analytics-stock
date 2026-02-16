@@ -39,6 +39,16 @@ services:
     command: ["python", "-m", "src.main", "scheduler"]
     restart: unless-stopped
 
+  executor:
+    <<: *worker-base
+    command: ["python", "-m", "src.main", "executor"]
+    restart: unless-stopped
+
+  agents:
+    <<: *worker-base
+    command: ["python", "-m", "src.main", "agents"]
+    restart: unless-stopped
+
   worker-daily:
     <<: *worker-base
     command: ["python", "-m", "src.main", "daily"]
@@ -47,4 +57,9 @@ services:
   worker-weekly:
     <<: *worker-base
     command: ["python", "-m", "src.main", "weekly"]
+    profiles: ["jobs"]
+
+  worker-research:
+    <<: *worker-base
+    command: ["python", "-m", "src.main", "research"]
     profiles: ["jobs"]

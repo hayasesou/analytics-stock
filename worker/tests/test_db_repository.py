@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
 
 from src.storage.db import NeonRepository
-from src.types import CitationItem, ReportItem
+from src.types import (
+    CitationItem,
+    FundamentalSnapshot,
+    OrderIntent,
+    PortfolioSpec,
+    ReportItem,
+    StrategyVersionSpec,
+)
 
 
 class _FakeCopy:
@@ -364,3 +371,137 @@ def test_upsert_signal_diagnostics_weekly_persists_three_horizons() -> None:
     ]
     assert len(rows) == 1
     assert len(rows[0]) == 3
+
+
+def test_upsert_strategy_version_and_activate() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchone_value = {"id": "11111111-1111-1111-1111-111111111111"}
+    repo = _repo_with_fake_conn(fake_conn)
+
+    repo.upsert_strategy_version(
+        StrategyVersionSpec(
+            strategy_name="mean-reversion-jp",
+            version=1,
+            spec={"asset_scope": "JP_EQ", "signal": {"type": "rule"}},
+            created_by="agent-coder",
+            is_active=True,
+        )
+    )
+
+    assert fake_conn.commit_count == 1
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "INSERT INTO strategies" in executed_sql
+    assert "INSERT INTO strategy_versions" in executed_sql
+    assert "UPDATE strategy_versions" in executed_sql
+
+
+def test_upsert_portfolio_and_order_intent() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    fake_conn._cursor.fetchone_value = {"id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}
+    portfolio_id = repo.upsert_portfolio(PortfolioSpec(name="core", base_currency="JPY", broker_map={"JP": "kabu"}))
+    assert portfolio_id == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+    fake_conn._cursor.fetchone_value = {"id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}
+    intent_id = repo.insert_order_intent(
+        OrderIntent(
+            portfolio_id=portfolio_id,
+            strategy_version_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
+            as_of=datetime(2026, 2, 15, 7, 0, 0),
+            target_positions=[{"symbol": "JP:1111", "target_qty": 100}],
+            status="proposed",
+            reason="weekly rebalance",
+            risk_checks={"max_drawdown": -0.03},
+        )
+    )
+    assert intent_id == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    assert fake_conn.commit_count == 2
+
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "INSERT INTO portfolios" in executed_sql
+    assert "INSERT INTO order_intents" in executed_sql
+
+
+def test_upsert_fundamental_snapshot_raises_for_unknown_security() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    snapshot = FundamentalSnapshot(
+        security_id="JP:1111",
+        as_of_date=date(2026, 2, 15),
+        rating="A",
+        summary="業績上方修正が継続。",
+        snapshot={"drivers": ["earnings_revision"]},
+    )
+
+    try:
+        repo.upsert_fundamental_snapshot(snapshot, security_uuid_map={})
+    except KeyError as exc:
+        assert "security not found" in str(exc)
+    else:
+        raise AssertionError("expected KeyError")
+
+
+def test_fetch_approved_order_intents_returns_rows() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchall_rows = [
+        {
+            "intent_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "portfolio_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "strategy_version_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "as_of": datetime(2026, 2, 15, 7, 0, 0),
+            "target_positions": [{"symbol": "JP:1111", "target_qty": 100}],
+            "reason": "rebalance",
+            "risk_checks": {"max_drawdown": -0.03},
+            "status": "approved",
+            "portfolio_name": "core",
+            "base_currency": "JPY",
+            "broker_map": {"JP": "kabu"},
+        }
+    ]
+    repo = _repo_with_fake_conn(fake_conn)
+
+    rows = repo.fetch_approved_order_intents(limit=10)
+
+    assert len(rows) == 1
+    assert rows[0]["intent_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "FROM order_intents oi" in executed_sql
+    assert "WHERE oi.status = 'approved'" in executed_sql
+
+
+def test_update_order_intent_status_updates_row() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    repo.update_order_intent_status(
+        intent_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        status="done",
+    )
+
+    assert fake_conn.commit_count == 1
+    assert len(fake_conn._cursor.execute_calls) == 1
+    query, params = fake_conn._cursor.execute_calls[0]
+    assert "UPDATE order_intents" in query
+    assert params == ("done", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+
+def test_fetch_latest_price_for_symbol_uses_security_or_ticker() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchone_value = {
+        "security_id": "JP:1111",
+        "market": "JP",
+        "ticker": "1111",
+        "trade_date": date(2026, 2, 15),
+        "close_raw": 1234.5,
+    }
+    repo = _repo_with_fake_conn(fake_conn)
+
+    row = repo.fetch_latest_price_for_symbol("JP:1111")
+
+    assert row is not None
+    assert row["close_raw"] == 1234.5
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "JOIN LATERAL" in executed_sql
+    assert "UPPER(s.ticker) = UPPER(%s)" in executed_sql

@@ -5,7 +5,9 @@ import time
 from zoneinfo import ZoneInfo
 
 from src.config import load_runtime_secrets
+from src.jobs.agents import run_agents_once
 from src.jobs.daily import run_daily
+from src.jobs.research import run_research
 from src.jobs.weekly import run_weekly
 from src.storage.db import NeonRepository
 
@@ -35,5 +37,13 @@ def run_scheduler(poll_seconds: int = 20, tz_name: str = "Asia/Tokyo") -> None:
         if now.weekday() == 5 and _is_after_or_equal(now, 6, 30):
             if not repo.has_run_for_date("weekly", now.date(), tz_name=tz_name):
                 run_weekly()
+
+        # Research loop: once after 07:00 JST when weekly run exists.
+        if _is_after_or_equal(now, 7, 0):
+            if not repo.has_run_for_date("research", now.date(), tz_name=tz_name):
+                run_research()
+
+        # Agent queue processor: lightweight tick each loop.
+        run_agents_once(limit=20)
 
         time.sleep(max(poll_seconds, 5))
