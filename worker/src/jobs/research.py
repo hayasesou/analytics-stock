@@ -4,6 +4,7 @@ from datetime import date, timedelta
 import traceback
 from typing import Any
 
+from src.analytics.validation import resolve_validation_policy, run_walk_forward_validation
 from src.config import load_runtime_secrets, load_yaml_config
 from src.research import (
     build_deep_research_snapshot,
@@ -94,6 +95,24 @@ def _build_eval_metrics(row: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def _extract_primary_validation_metrics(validation_result: dict[str, Any]) -> dict[str, Any]:
+    gate = validation_result.get("gate") or {}
+    summary = validation_result.get("summary") or {}
+    primary_profile = str(gate.get("primary_cost_profile", "strict"))
+    primary = summary.get(primary_profile) or {}
+    return {
+        "validation_passed": bool(gate.get("passed", False)),
+        "validation_primary_profile": primary_profile,
+        "validation_fold_count": int(primary.get("fold_count") or 0),
+        "validation_total_trades": int(primary.get("total_trades") or 0),
+        "validation_mean_sharpe": primary.get("mean_sharpe"),
+        "validation_median_sharpe": primary.get("median_sharpe"),
+        "validation_worst_max_dd": primary.get("worst_max_dd"),
+        "validation_mean_cagr": primary.get("mean_cagr"),
+        "validation_fail_reasons": list(gate.get("reasons") or []),
+    }
+
+
 def run_research(limit: int | None = None) -> str:
     cfg = load_yaml_config()
     secrets = load_runtime_secrets()
@@ -114,9 +133,11 @@ def run_research(limit: int | None = None) -> str:
         overlay_cfg = sf_cfg.get("fundamental_overlay", {})
         if not isinstance(overlay_cfg, dict):
             overlay_cfg = {}
+        validation_policy = resolve_validation_policy(cfg)
         candidates = repo.fetch_latest_weekly_candidates(limit=candidate_limit)
         processed = 0
         today = date.today()
+        validation_lookback_days = int(validation_policy.get("lookback_days", 365))
 
         for row in candidates:
             processed += 1
@@ -130,7 +151,34 @@ def run_research(limit: int | None = None) -> str:
                 has_major_contradiction=bool(row.get("has_major_contradiction") or False),
                 primary_source_count=int(row.get("primary_source_count") or 0),
             )
-            strategy_status = _strategy_status_for_rating(rating, overlay_cfg)
+            base_status = _strategy_status_for_rating(rating, overlay_cfg)
+
+            validation_result: dict[str, Any] | None = None
+            if bool(validation_policy.get("enabled", True)):
+                lookback_days = int(validation_policy.get("lookback_days", 900))
+                price_history = repo.fetch_price_history_for_security(
+                    security_id=security_id,
+                    start_date=today - timedelta(days=lookback_days),
+                    end_date=today,
+                )
+                validation_result = run_walk_forward_validation(
+                    prices=price_history,
+                    security_id=security_id,
+                    market=market,
+                    config=cfg,
+                    policy=validation_policy,
+                )
+                eval_metrics: dict[str, Any] = _extract_primary_validation_metrics(validation_result)
+            else:
+                eval_metrics = _build_eval_metrics(row)
+                eval_metrics["validation_passed"] = True
+                eval_metrics["validation_fail_reasons"] = []
+
+            strategy_status = base_status
+            candidate_status = str(overlay_cfg.get("screening_pass_status", "candidate"))
+            blocked_status = str(overlay_cfg.get("screening_block_status", "draft"))
+            if strategy_status == candidate_status and not bool(eval_metrics.get("validation_passed", False)):
+                strategy_status = blocked_status
 
             strategy_name = f"sf-{security_id.lower().replace(':', '-')}"
             strategy_id = repo.upsert_strategy(
@@ -151,15 +199,18 @@ def run_research(limit: int | None = None) -> str:
                     is_active=False,
                 )
             )
-            eval_metrics = _build_eval_metrics(row)
             repo.insert_strategy_evaluation(
                 StrategyEvaluation(
                     strategy_version_id=strategy_version_id,
-                    eval_type="quick_backtest",
-                    period_start=today - timedelta(days=365),
+                    eval_type="robust_backtest" if bool(validation_policy.get("enabled", True)) else "quick_backtest",
+                    period_start=today - timedelta(days=validation_lookback_days),
                     period_end=today,
                     metrics=eval_metrics,
-                    artifacts={"strategy_id": strategy_id, "run_id": run_id},
+                    artifacts={
+                        "strategy_id": strategy_id,
+                        "run_id": run_id,
+                        "validation": validation_result,
+                    },
                 )
             )
 
@@ -174,6 +225,7 @@ def run_research(limit: int | None = None) -> str:
                 "combined_score": float(row.get("combined_score") or 0.0),
                 "edge_score": float(row.get("edge_score") or 0.0),
                 "screening_status": strategy_status,
+                "validation": validation_result or {"enabled": False},
             }
             repo.upsert_fundamental_snapshot(
                 FundamentalSnapshot(
@@ -188,20 +240,21 @@ def run_research(limit: int | None = None) -> str:
                 ),
             )
 
-            for idx, task_type in enumerate(agent_task_types):
-                repo.enqueue_agent_task(
-                    task_type=task_type,
-                    payload={
-                        "run_id": run_id,
-                        "strategy_name": strategy_name,
-                        "strategy_version_id": strategy_version_id,
-                        "security_id": security_id,
-                        "market": market,
-                        "combined_score": float(row.get("combined_score") or 0.0),
-                        "agent_role": task_type,
-                    },
-                    priority=10 + idx,
-                )
+            if strategy_status == candidate_status:
+                for idx, task_type in enumerate(agent_task_types):
+                    repo.enqueue_agent_task(
+                        task_type=task_type,
+                        payload={
+                            "run_id": run_id,
+                            "strategy_name": strategy_name,
+                            "strategy_version_id": strategy_version_id,
+                            "security_id": security_id,
+                            "market": market,
+                            "combined_score": float(row.get("combined_score") or 0.0),
+                            "agent_role": task_type,
+                        },
+                        priority=10 + idx,
+                    )
 
             if processed >= max_parallel:
                 break
@@ -239,6 +292,7 @@ def run_research(limit: int | None = None) -> str:
                 "candidate_count": len(candidates),
                 "processed": processed,
                 "deep_research_imported": deep_saved,
+                "validation_policy": validation_policy,
             },
         )
     except Exception as exc:  # noqa: BLE001

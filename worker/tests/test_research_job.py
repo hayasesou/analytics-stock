@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 from types import SimpleNamespace
 
+import pandas as pd
+
 from src.jobs import research as research_job
 
 
@@ -44,7 +46,7 @@ class _FakeRepo:
         return "strategy-version-1"
 
     def insert_strategy_evaluation(self, evaluation):  # noqa: ANN001
-        assert evaluation.eval_type == "quick_backtest"
+        assert evaluation.eval_type == "robust_backtest"
         assert isinstance(evaluation.period_start, date)
         return "eval-1"
 
@@ -60,6 +62,22 @@ class _FakeRepo:
     def finish_run(self, run_id: str, status: str, metadata=None):  # noqa: ANN001
         self.finished = (status, metadata or {})
 
+    def fetch_price_history_for_security(self, security_id: str, start_date: date, end_date: date):  # noqa: ANN001
+        _ = (security_id, start_date, end_date)
+        return pd.DataFrame(
+            [
+                {
+                    "security_id": "JP:1111",
+                    "market": "JP",
+                    "trade_date": date(2025, 1, 10),
+                    "open_raw": 100.0,
+                    "high_raw": 101.0,
+                    "low_raw": 99.0,
+                    "close_raw": 100.5,
+                }
+            ]
+        )
+
 
 def test_run_research_creates_candidates_and_tasks(monkeypatch):
     fake_repo = _FakeRepo("postgresql://unused")
@@ -71,6 +89,24 @@ def test_run_research_creates_candidates_and_tasks(monkeypatch):
     monkeypatch.setattr(research_job, "load_runtime_secrets", lambda: SimpleNamespace(database_url="postgresql://unused", openai_api_key=None))
     monkeypatch.setattr(research_job, "NeonRepository", lambda dsn: fake_repo)
     monkeypatch.setattr(research_job, "parse_deep_research_file_if_configured", lambda: None)
+    monkeypatch.setattr(
+        research_job,
+        "run_walk_forward_validation",
+        lambda **kwargs: {  # noqa: ARG005
+            "gate": {"passed": True, "primary_cost_profile": "strict", "reasons": []},
+            "summary": {
+                "strict": {
+                    "fold_count": 3,
+                    "total_trades": 10,
+                    "mean_sharpe": 0.5,
+                    "median_sharpe": 0.4,
+                    "worst_max_dd": -0.15,
+                    "mean_cagr": 0.08,
+                }
+            },
+            "folds": [],
+        },
+    )
 
     run_id = research_job.run_research(limit=1)
 
@@ -125,6 +161,24 @@ def test_run_research_blocks_candidate_when_rating_c(monkeypatch):
     )
     monkeypatch.setattr(research_job, "NeonRepository", lambda dsn: fake_repo)
     monkeypatch.setattr(research_job, "parse_deep_research_file_if_configured", lambda: None)
+    monkeypatch.setattr(
+        research_job,
+        "run_walk_forward_validation",
+        lambda **kwargs: {  # noqa: ARG005
+            "gate": {"passed": False, "primary_cost_profile": "strict", "reasons": ["median_sharpe<0.3"]},
+            "summary": {
+                "strict": {
+                    "fold_count": 1,
+                    "total_trades": 1,
+                    "mean_sharpe": -0.1,
+                    "median_sharpe": -0.1,
+                    "worst_max_dd": -0.5,
+                    "mean_cagr": -0.02,
+                }
+            },
+            "folds": [],
+        },
+    )
 
     research_job.run_research(limit=1)
 

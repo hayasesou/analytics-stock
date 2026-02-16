@@ -1573,6 +1573,48 @@ class NeonRepository:
             row = cur.fetchone()
         return row
 
+    def fetch_price_history_for_security(
+        self,
+        security_id: str,
+        start_date: date,
+        end_date: date,
+    ) -> pd.DataFrame:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.security_id,
+                    s.market,
+                    p.trade_date,
+                    p.open_raw,
+                    p.high_raw,
+                    p.low_raw,
+                    p.close_raw
+                FROM prices_daily p
+                JOIN securities s
+                  ON s.id = p.security_id
+                WHERE s.security_id = %s
+                  AND p.trade_date BETWEEN %s AND %s
+                ORDER BY p.trade_date
+                """,
+                (security_id, start_date, end_date),
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "security_id",
+                    "market",
+                    "trade_date",
+                    "open_raw",
+                    "high_raw",
+                    "low_raw",
+                    "close_raw",
+                ]
+            )
+        return pd.DataFrame(rows)
+
     def fetch_latest_fundamental_ratings_by_symbols(self, symbols: list[str]) -> dict[str, str]:
         cleaned = [str(symbol).strip() for symbol in symbols if str(symbol).strip()]
         if not cleaned:
