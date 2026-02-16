@@ -12,7 +12,23 @@ import pandas as pd
 import psycopg
 from psycopg.rows import dict_row
 
-from src.types import BacktestResult, CitationItem, EventItem, ReportItem, Security
+from src.types import (
+    BacktestResult,
+    CitationItem,
+    EventItem,
+    FillRecord,
+    FundamentalSnapshot,
+    OrderIntent,
+    OrderRecord,
+    PortfolioSpec,
+    PositionRecord,
+    ReportItem,
+    RiskSnapshot,
+    Security,
+    StrategyEvaluation,
+    StrategySpec,
+    StrategyVersionSpec,
+)
 
 
 def _chunks(seq: list[Any], size: int = 1000) -> Iterator[list[Any]]:
@@ -131,15 +147,32 @@ class NeonRepository:
         universe: str,
         as_of_date: date,
         source: str,
+        reset_existing: bool = True,
     ) -> None:
         values = [
             (sec_uuid, universe, as_of_date, True, source)
             for sec_uuid in security_uuid_map.values()
         ]
-        if not values:
-            return
 
         with self._conn() as conn, conn.cursor() as cur:
+            if reset_existing:
+                cur.execute(
+                    """
+                    UPDATE universe_membership
+                    SET is_member = false,
+                        source = %s,
+                        retrieved_at = NOW()
+                    WHERE universe = %s
+                      AND as_of_date = %s
+                      AND is_member = true
+                    """,
+                    (source, universe, as_of_date),
+                )
+
+            if not values:
+                conn.commit()
+                return
+
             for batch in _chunks(values):
                 cur.executemany(
                     """
@@ -236,6 +269,21 @@ class NeonRepository:
                               source = EXCLUDED.source,
                               retrieved_at = NOW()
                 """
+            )
+            conn.commit()
+
+    def delete_prices_range(self, security_ids: list[str], start_date: date, end_date: date) -> None:
+        if not security_ids:
+            return
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM prices_daily
+                WHERE security_id = ANY(%s::uuid[])
+                  AND trade_date BETWEEN %s AND %s
+                """,
+                (security_ids, start_date, end_date),
             )
             conn.commit()
 
@@ -992,6 +1040,673 @@ class NeonRepository:
                     )
 
             conn.commit()
+
+    def upsert_strategy(self, strategy: StrategySpec) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO strategies (name, description, asset_scope, status)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (name)
+                DO UPDATE SET description = EXCLUDED.description,
+                              asset_scope = EXCLUDED.asset_scope,
+                              status = EXCLUDED.status,
+                              updated_at = NOW()
+                RETURNING id::text
+                """,
+                (
+                    strategy.name,
+                    strategy.description,
+                    strategy.asset_scope,
+                    strategy.status,
+                ),
+            )
+            strategy_id = cur.fetchone()["id"]
+            conn.commit()
+        return strategy_id
+
+    def upsert_strategy_version(self, version: StrategyVersionSpec) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO strategies (name, asset_scope, status)
+                VALUES (%s, %s, 'draft')
+                ON CONFLICT (name)
+                DO UPDATE SET updated_at = NOW()
+                RETURNING id::text
+                """,
+                (version.strategy_name, version.spec.get("asset_scope", "MIXED")),
+            )
+            strategy_id = cur.fetchone()["id"]
+
+            cur.execute(
+                """
+                INSERT INTO strategy_versions (
+                    strategy_id, version, spec, code_artifact_key, sha256, created_by,
+                    approved_by, approved_at, is_active
+                )
+                VALUES (%s::uuid, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (strategy_id, version)
+                DO UPDATE SET spec = EXCLUDED.spec,
+                              code_artifact_key = EXCLUDED.code_artifact_key,
+                              sha256 = EXCLUDED.sha256,
+                              created_by = EXCLUDED.created_by,
+                              approved_by = EXCLUDED.approved_by,
+                              approved_at = EXCLUDED.approved_at,
+                              is_active = EXCLUDED.is_active
+                RETURNING id::text
+                """,
+                (
+                    strategy_id,
+                    version.version,
+                    json.dumps(version.spec),
+                    version.code_artifact_key,
+                    version.sha256,
+                    version.created_by,
+                    version.approved_by,
+                    version.approved_at,
+                    version.is_active,
+                ),
+            )
+            strategy_version_id = cur.fetchone()["id"]
+
+            if version.is_active:
+                cur.execute(
+                    """
+                    UPDATE strategy_versions
+                    SET is_active = (id = %s::uuid)
+                    WHERE strategy_id = %s::uuid
+                    """,
+                    (strategy_version_id, strategy_id),
+                )
+
+            conn.commit()
+        return strategy_version_id
+
+    def insert_strategy_evaluation(self, evaluation: StrategyEvaluation) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO strategy_evaluations (
+                    strategy_version_id, eval_type, period_start, period_end, metrics, artifacts
+                )
+                VALUES (%s::uuid, %s, %s, %s, %s::jsonb, %s::jsonb)
+                RETURNING id::text
+                """,
+                (
+                    evaluation.strategy_version_id,
+                    evaluation.eval_type,
+                    evaluation.period_start,
+                    evaluation.period_end,
+                    json.dumps(evaluation.metrics),
+                    json.dumps(evaluation.artifacts),
+                ),
+            )
+            evaluation_id = cur.fetchone()["id"]
+            conn.commit()
+        return evaluation_id
+
+    def upsert_portfolio(self, portfolio: PortfolioSpec) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO portfolios (name, base_currency, broker_map)
+                VALUES (%s, %s, %s::jsonb)
+                ON CONFLICT (name)
+                DO UPDATE SET base_currency = EXCLUDED.base_currency,
+                              broker_map = EXCLUDED.broker_map
+                RETURNING id::text
+                """,
+                (
+                    portfolio.name,
+                    portfolio.base_currency,
+                    json.dumps(portfolio.broker_map),
+                ),
+            )
+            portfolio_id = cur.fetchone()["id"]
+            conn.commit()
+        return portfolio_id
+
+    def insert_order_intent(self, intent: OrderIntent) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO order_intents (
+                    portfolio_id, strategy_version_id, as_of, target_positions, reason,
+                    risk_checks, status, approved_at, approved_by
+                )
+                VALUES (%s::uuid, %s::uuid, %s, %s::jsonb, %s, %s::jsonb, %s, %s, %s)
+                RETURNING id::text
+                """,
+                (
+                    intent.portfolio_id,
+                    intent.strategy_version_id,
+                    intent.as_of,
+                    json.dumps(intent.target_positions),
+                    intent.reason,
+                    json.dumps(intent.risk_checks),
+                    intent.status,
+                    intent.approved_at,
+                    intent.approved_by,
+                ),
+            )
+            intent_id = cur.fetchone()["id"]
+            conn.commit()
+        return intent_id
+
+    def insert_orders_bulk(self, orders: list[OrderRecord]) -> list[str]:
+        if not orders:
+            return []
+
+        ids = [str(uuid4()) for _ in orders]
+        rows: list[tuple[Any, ...]] = []
+        for order_id, order in zip(ids, orders, strict=True):
+            rows.append(
+                (
+                    order_id,
+                    order.intent_id,
+                    order.broker,
+                    order.account_id,
+                    order.symbol,
+                    order.instrument_type,
+                    order.side,
+                    order.order_type,
+                    float(order.qty),
+                    order.limit_price,
+                    order.stop_price,
+                    order.time_in_force,
+                    order.status,
+                    order.broker_order_id,
+                    order.idempotency_key,
+                    order.submitted_at,
+                    json.dumps(order.meta),
+                )
+            )
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO orders (
+                    id, intent_id, broker, account_id, symbol, instrument_type, side, order_type,
+                    qty, limit_price, stop_price, time_in_force, status, broker_order_id,
+                    idempotency_key, submitted_at, meta
+                )
+                VALUES (
+                    %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s::jsonb
+                )
+                ON CONFLICT (broker, idempotency_key)
+                DO UPDATE SET account_id = EXCLUDED.account_id,
+                              symbol = EXCLUDED.symbol,
+                              instrument_type = EXCLUDED.instrument_type,
+                              side = EXCLUDED.side,
+                              order_type = EXCLUDED.order_type,
+                              qty = EXCLUDED.qty,
+                              limit_price = EXCLUDED.limit_price,
+                              stop_price = EXCLUDED.stop_price,
+                              time_in_force = EXCLUDED.time_in_force,
+                              status = EXCLUDED.status,
+                              broker_order_id = EXCLUDED.broker_order_id,
+                              submitted_at = EXCLUDED.submitted_at,
+                              updated_at = NOW(),
+                              meta = EXCLUDED.meta
+                """,
+                rows,
+            )
+            conn.commit()
+        return ids
+
+    def insert_order_fills(self, fills: list[FillRecord]) -> None:
+        if not fills:
+            return
+
+        rows = [
+            (
+                fill.order_id,
+                fill.fill_time,
+                float(fill.qty),
+                float(fill.price),
+                float(fill.fee),
+                json.dumps(fill.meta),
+            )
+            for fill in fills
+        ]
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO order_fills (
+                    order_id, fill_time, qty, price, fee, meta
+                )
+                VALUES (%s::uuid, %s, %s, %s, %s, %s::jsonb)
+                """,
+                rows,
+            )
+            conn.commit()
+
+    def upsert_positions(self, positions: list[PositionRecord]) -> None:
+        if not positions:
+            return
+
+        rows = [
+            (
+                position.portfolio_id,
+                position.symbol,
+                position.instrument_type,
+                float(position.qty),
+                position.avg_price,
+                position.last_price,
+                position.market_value,
+                position.unrealized_pnl,
+                position.realized_pnl,
+            )
+            for position in positions
+        ]
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO positions (
+                    portfolio_id, symbol, instrument_type, qty, avg_price, last_price,
+                    market_value, unrealized_pnl, realized_pnl
+                )
+                VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (portfolio_id, symbol, instrument_type)
+                DO UPDATE SET qty = EXCLUDED.qty,
+                              avg_price = EXCLUDED.avg_price,
+                              last_price = EXCLUDED.last_price,
+                              market_value = EXCLUDED.market_value,
+                              unrealized_pnl = EXCLUDED.unrealized_pnl,
+                              realized_pnl = EXCLUDED.realized_pnl,
+                              updated_at = NOW()
+                """,
+                rows,
+            )
+            conn.commit()
+
+    def insert_risk_snapshot(self, snapshot: RiskSnapshot) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO risk_snapshots (
+                    portfolio_id, as_of, equity, drawdown, sharpe_20d, gross_exposure,
+                    net_exposure, state, triggers
+                )
+                VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (portfolio_id, as_of)
+                DO UPDATE SET equity = EXCLUDED.equity,
+                              drawdown = EXCLUDED.drawdown,
+                              sharpe_20d = EXCLUDED.sharpe_20d,
+                              gross_exposure = EXCLUDED.gross_exposure,
+                              net_exposure = EXCLUDED.net_exposure,
+                              state = EXCLUDED.state,
+                              triggers = EXCLUDED.triggers
+                RETURNING id::text
+                """,
+                (
+                    snapshot.portfolio_id,
+                    snapshot.as_of,
+                    float(snapshot.equity),
+                    float(snapshot.drawdown),
+                    snapshot.sharpe_20d,
+                    snapshot.gross_exposure,
+                    snapshot.net_exposure,
+                    snapshot.state,
+                    json.dumps(snapshot.triggers),
+                ),
+            )
+            risk_snapshot_id = cur.fetchone()["id"]
+            conn.commit()
+        return risk_snapshot_id
+
+    def upsert_fundamental_snapshot(
+        self,
+        snapshot: FundamentalSnapshot,
+        security_uuid_map: dict[str, str] | None = None,
+    ) -> None:
+        security_uuid = None
+        if security_uuid_map:
+            security_uuid = security_uuid_map.get(snapshot.security_id)
+        if not security_uuid:
+            with self._conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id::text
+                    FROM securities
+                    WHERE security_id = %s
+                    LIMIT 1
+                    """,
+                    (snapshot.security_id,),
+                )
+                row = cur.fetchone()
+                security_uuid = row["id"] if row else None
+        if not security_uuid:
+            raise KeyError(f"security not found: {snapshot.security_id}")
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO fundamental_snapshots (
+                    security_id, as_of_date, source, rating, confidence,
+                    summary, snapshot, created_by
+                )
+                VALUES (%s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (security_id, as_of_date, source)
+                DO UPDATE SET rating = EXCLUDED.rating,
+                              confidence = EXCLUDED.confidence,
+                              summary = EXCLUDED.summary,
+                              snapshot = EXCLUDED.snapshot,
+                              created_by = EXCLUDED.created_by
+                """,
+                (
+                    security_uuid,
+                    snapshot.as_of_date,
+                    snapshot.source,
+                    snapshot.rating,
+                    snapshot.confidence,
+                    snapshot.summary,
+                    json.dumps(snapshot.snapshot),
+                    snapshot.created_by,
+                ),
+            )
+            conn.commit()
+
+    def enqueue_agent_task(
+        self,
+        task_type: str,
+        payload: dict[str, Any],
+        priority: int = 100,
+    ) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_tasks (task_type, priority, status, payload)
+                VALUES (%s, %s, 'queued', %s::jsonb)
+                RETURNING id::text
+                """,
+                (task_type, int(priority), json.dumps(payload)),
+            )
+            task_id = cur.fetchone()["id"]
+            conn.commit()
+        return task_id
+
+    def mark_agent_task(
+        self,
+        task_id: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+        cost_usd: float | None = None,
+    ) -> None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE agent_tasks
+                SET status = %s,
+                    result = COALESCE(%s::jsonb, result),
+                    cost_usd = COALESCE(%s, cost_usd),
+                    started_at = CASE WHEN status = 'queued' AND %s = 'running' THEN NOW() ELSE started_at END,
+                    finished_at = CASE WHEN %s IN ('success', 'failed', 'canceled') THEN NOW() ELSE finished_at END
+                WHERE id = %s::uuid
+                """,
+                (
+                    status,
+                    json.dumps(result) if result is not None else None,
+                    cost_usd,
+                    status,
+                    status,
+                    task_id,
+                ),
+            )
+            conn.commit()
+
+    def fetch_approved_order_intents(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    oi.id::text AS intent_id,
+                    oi.portfolio_id::text AS portfolio_id,
+                    oi.strategy_version_id::text AS strategy_version_id,
+                    oi.as_of,
+                    oi.target_positions,
+                    oi.reason,
+                    oi.risk_checks,
+                    oi.status,
+                    p.name AS portfolio_name,
+                    p.base_currency,
+                    p.broker_map
+                FROM order_intents oi
+                JOIN portfolios p
+                  ON p.id = oi.portfolio_id
+                WHERE oi.status = 'approved'
+                ORDER BY oi.created_at ASC
+                LIMIT %s
+                """,
+                (max(1, int(limit)),),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def update_order_intent_status(self, intent_id: str, status: str) -> None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE order_intents
+                SET status = %s
+                WHERE id = %s::uuid
+                """,
+                (status, intent_id),
+            )
+            conn.commit()
+
+    def fetch_latest_risk_snapshot(self, portfolio_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    portfolio_id::text AS portfolio_id,
+                    as_of,
+                    equity,
+                    drawdown,
+                    sharpe_20d,
+                    gross_exposure,
+                    net_exposure,
+                    state,
+                    triggers
+                FROM risk_snapshots
+                WHERE portfolio_id = %s::uuid
+                ORDER BY as_of DESC
+                LIMIT 1
+                """,
+                (portfolio_id,),
+            )
+            row = cur.fetchone()
+        return row
+
+    def fetch_recent_risk_snapshots(self, portfolio_id: str, limit: int = 40) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    as_of,
+                    equity,
+                    drawdown,
+                    sharpe_20d,
+                    state
+                FROM risk_snapshots
+                WHERE portfolio_id = %s::uuid
+                ORDER BY as_of DESC
+                LIMIT %s
+                """,
+                (portfolio_id, max(2, int(limit))),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def fetch_latest_price_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.security_id,
+                    s.market,
+                    s.ticker,
+                    pd.trade_date,
+                    pd.close_raw
+                FROM securities s
+                JOIN LATERAL (
+                    SELECT trade_date, close_raw
+                    FROM prices_daily p
+                    WHERE p.security_id = s.id
+                    ORDER BY trade_date DESC
+                    LIMIT 1
+                ) pd ON TRUE
+                WHERE s.security_id = %s
+                   OR UPPER(s.ticker) = UPPER(%s)
+                ORDER BY CASE WHEN s.security_id = %s THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                (symbol, symbol, symbol),
+            )
+            row = cur.fetchone()
+        return row
+
+    def fetch_latest_fundamental_ratings_by_symbols(self, symbols: list[str]) -> dict[str, str]:
+        cleaned = [str(symbol).strip() for symbol in symbols if str(symbol).strip()]
+        if not cleaned:
+            return {}
+        unique = list(dict.fromkeys(cleaned))
+        ticker_candidates = []
+        for symbol in unique:
+            if ":" in symbol:
+                ticker_candidates.append(symbol.split(":", 1)[1].upper())
+            else:
+                ticker_candidates.append(symbol.upper())
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.security_id,
+                    UPPER(s.ticker) AS ticker_upper,
+                    fs.rating
+                FROM securities s
+                JOIN LATERAL (
+                    SELECT rating
+                    FROM fundamental_snapshots f
+                    WHERE f.security_id = s.id
+                    ORDER BY f.as_of_date DESC, f.created_at DESC
+                    LIMIT 1
+                ) fs ON TRUE
+                WHERE s.security_id = ANY(%s)
+                   OR UPPER(s.ticker) = ANY(%s)
+                """,
+                (unique, ticker_candidates),
+            )
+            rows = cur.fetchall()
+
+        rating_by_security: dict[str, str] = {}
+        rating_by_ticker: dict[str, str] = {}
+        for row in rows:
+            rating = str(row.get("rating", "")).upper().strip()
+            security_id = str(row.get("security_id", "")).strip()
+            ticker = str(row.get("ticker_upper", "")).strip()
+            if rating:
+                if security_id:
+                    rating_by_security[security_id] = rating
+                if ticker:
+                    rating_by_ticker[ticker] = rating
+
+        output: dict[str, str] = {}
+        for symbol in unique:
+            if symbol in rating_by_security:
+                output[symbol] = rating_by_security[symbol]
+                continue
+            ticker = symbol.split(":", 1)[1].upper() if ":" in symbol else symbol.upper()
+            if ticker in rating_by_ticker:
+                output[symbol] = rating_by_ticker[ticker]
+        return output
+
+    def fetch_latest_weekly_candidates(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH latest_run AS (
+                    SELECT id
+                    FROM runs
+                    WHERE run_type = 'weekly'
+                      AND status = 'success'
+                    ORDER BY finished_at DESC NULLS LAST, started_at DESC
+                    LIMIT 1
+                )
+                SELECT
+                    s.security_id,
+                    s.market,
+                    s.ticker,
+                    s.name,
+                    sc.combined_score,
+                    sc.confidence,
+                    sc.missing_ratio,
+                    COALESCE((sc.flags->>'edge_score')::double precision, 0.0) AS edge_score,
+                    COALESCE(es.primary_source_count, 0) AS primary_source_count,
+                    COALESCE(es.has_major_contradiction, FALSE) AS has_major_contradiction
+                FROM latest_run lr
+                JOIN top50_membership t
+                  ON t.run_id = lr.id
+                JOIN securities s
+                  ON s.id = t.security_id
+                LEFT JOIN score_snapshots sc
+                  ON sc.run_id = t.run_id
+                 AND sc.security_id = t.security_id
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COUNT(DISTINCT c.doc_version_id)::int AS primary_source_count,
+                        BOOL_OR(
+                          e.title ~* '(下方修正|訂正|撤回)'
+                          OR COALESCE(e.summary, '') ~* '(下方修正|訂正|撤回)'
+                        ) AS has_major_contradiction
+                    FROM reports r
+                    LEFT JOIN citations c
+                      ON c.report_id = r.id
+                    LEFT JOIN events e
+                      ON e.security_id = r.security_id
+                     AND e.event_time >= NOW() - INTERVAL '30 day'
+                    WHERE r.security_id = t.security_id
+                      AND r.created_at >= NOW() - INTERVAL '30 day'
+                ) es ON TRUE
+                ORDER BY t.rank ASC
+                LIMIT %s
+                """,
+                (max(1, int(limit)),),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def fetch_queued_agent_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    task_type,
+                    priority,
+                    status,
+                    payload,
+                    result,
+                    cost_usd,
+                    started_at,
+                    finished_at,
+                    created_at
+                FROM agent_tasks
+                WHERE status = 'queued'
+                ORDER BY priority ASC, created_at ASC
+                LIMIT %s
+                """,
+                (max(1, int(limit)),),
+            )
+            rows = cur.fetchall()
+        return rows
 
     def latest_weekly_run_id(self) -> str | None:
         with self._conn() as conn, conn.cursor() as cur:

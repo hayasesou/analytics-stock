@@ -51,10 +51,10 @@ docker compose --profile setup run --rm db-bootstrap
 bash scripts/bootstrap.sh
 ```
 
-3. 常駐起動（Web + Worker Scheduler）
+3. 常駐起動（Web + Worker Scheduler + Executor + Agents）
 
 ```bash
-docker compose up -d web worker
+docker compose up -d web worker executor agents
 ```
 
 4. 手動ジョブ実行（必要時）
@@ -62,6 +62,16 @@ docker compose up -d web worker
 ```bash
 docker compose --profile jobs run --rm worker-daily
 docker compose --profile jobs run --rm worker-weekly
+docker compose --profile jobs run --rm worker-research
+```
+
+5. Deep Research レポート取込（任意）
+
+```bash
+# 例: GUIの deep research レポートを保存したテキストを取り込む
+export DEEP_RESEARCH_REPORT_PATH=/app/source/deep_research_3513.txt
+export DEEP_RESEARCH_SECURITY_ID=JP:3513
+docker compose --profile jobs run --rm worker-research
 ```
 
 ## バッチスケジュール（JST）
@@ -97,6 +107,9 @@ docker compose --profile jobs run --rm worker-weekly
 - 有効化フラグ:
   - `LLM_SECURITY_REPORTS_ENABLED=1`
   - `LLM_WEEKLY_SUMMARY_ENABLED=1`
+- 研究ループで Deep Research 構造化を使う場合:
+  - `DEEP_RESEARCH_REPORT_PATH`
+  - `DEEP_RESEARCH_SECURITY_ID`
 - 安全装置（任意・既定値あり）:
   - `LLM_SECURITY_REPORT_MAX_CALLS=20`
   - `LLM_SECURITY_REPORT_MAX_CONSECUTIVE_FAILURES=3`
@@ -104,6 +117,19 @@ docker compose --profile jobs run --rm worker-weekly
   - `LLM_SECURITY_REPORT_TIMEOUT_SEC=12`
   - `LLM_WEEKLY_SUMMARY_TIMEOUT_SEC=12`
 - 未設定/0 の場合は既存テンプレ生成です。
+
+## LV4 研究ループ / 実行ループ
+
+- `worker-research`:
+  - 最新 weekly 候補から戦略候補 (`strategies`, `strategy_versions`, `strategy_evaluations`) を生成
+  - A/B/C ファンダ判断 (`fundamental_snapshots`) を作成
+  - 5つの自律エージェントタスク (`agent_tasks`) を起票
+- `agents`:
+  - キューを並列処理し、戦略設計/コード/特徴量/リスク評価/オーケストレーション結果を記録
+- `executor`:
+  - 承認済み `order_intents` のみ実行
+  - DD 3% / rolling SR(20d) のリスクゲート
+  - A/B/C を使った最終発注ゲート（C除外、B縮小、A通常）
 
 ### LLM テスト
 

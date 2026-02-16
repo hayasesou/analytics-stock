@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from io import StringIO
 import re
 import uuid
 
 import numpy as np
 import pandas as pd
+import requests
 
 from src.config import RuntimeSecrets
 from src.integrations.edinet import EdinetClient
@@ -16,8 +18,9 @@ from src.integrations.sec import SecEdgarClient
 from src.types import EventItem, Security
 
 JP_UNIVERSE_LIMIT = 60
-US_UNIVERSE_LIMIT = 120
+US_UNIVERSE_LIMIT = 40
 JP_COMMON_MARKET_KEYWORDS = ("プライム", "スタンダード", "グロース", "内国株式", "Prime", "Standard", "Growth")
+JP_EXCLUDE_NAME_KEYWORDS = ("ETF", "ETN", "REIT", "投資証券", "インデックス", "指数")
 US_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,6}$")
 SEC_HIGH_FORMS = {"8-K", "6-K"}
 SEC_MEDIUM_FORMS = {"10-K", "10-Q", "20-F", "DEF 14A"}
@@ -29,6 +32,7 @@ EDINET_MEDIUM_KEYWORDS = ("有価証券報告書", "四半期報告書", "半期
 class HybridDataProvider:
     secrets: RuntimeSecrets
     seed: int = 42
+    allow_mock_price_fallback: bool = False
 
     def _rng(self) -> np.random.Generator:
         return np.random.default_rng(self.seed)
@@ -104,6 +108,11 @@ class HybridDataProvider:
             return True
         return any(keyword in name for keyword in JP_COMMON_MARKET_KEYWORDS)
 
+    @staticmethod
+    def _is_jp_excluded_name(name: str) -> bool:
+        upper_name = name.upper()
+        return any(keyword in upper_name for keyword in JP_EXCLUDE_NAME_KEYWORDS)
+
     def _load_jp_securities_live(self) -> list[Security]:
         client = JQuantsClient(
             api_key=self.secrets.jquants_api_key,
@@ -134,6 +143,8 @@ class HybridDataProvider:
                 or ""
             ).strip()
             if not name:
+                continue
+            if self._is_jp_excluded_name(name):
                 continue
             if code in by_code:
                 continue
@@ -184,6 +195,11 @@ class HybridDataProvider:
 
             exchange = str(row.get("primary_exchange") or "").strip() or None
             sector = str(row.get("sic_description") or "").strip() or None
+            market_cap = row.get("market_cap")
+            try:
+                market_cap_value = float(market_cap) if market_cap is not None else 0.0
+            except (TypeError, ValueError):
+                market_cap_value = 0.0
             by_ticker[ticker] = Security(
                 security_id="",
                 market="US",
@@ -194,15 +210,22 @@ class HybridDataProvider:
                 metadata={
                     "source": "massive",
                     "exchange": exchange,
+                    "market_cap": market_cap_value,
                 },
             )
 
+        ordered = sorted(
+            by_ticker.values(),
+            key=lambda s: (
+                -float(s.metadata.get("market_cap", 0.0) or 0.0),
+                s.ticker,
+            ),
+        )
         securities: list[Security] = []
-        for ticker in sorted(by_ticker.keys())[:US_UNIVERSE_LIMIT]:
-            sec = by_ticker[ticker]
+        for sec in ordered[:US_UNIVERSE_LIMIT]:
             securities.append(
                 Security(
-                    security_id=f"US:{ticker}",
+                    security_id=f"US:{sec.ticker}",
                     market=sec.market,
                     ticker=sec.ticker,
                     name=sec.name,
@@ -299,6 +322,41 @@ class HybridDataProvider:
         start_date: datetime,
         end_date: datetime,
     ) -> pd.DataFrame:
+        if not securities:
+            return pd.DataFrame()
+
+        live = self._load_price_history_live(securities=securities, start_date=start_date, end_date=end_date)
+        covered = set(live["security_id"].dropna().unique()) if not live.empty else set()
+        missing = [s for s in securities if s.security_id not in covered]
+
+        if missing and self.allow_mock_price_fallback:
+            print(
+                f"[provider] prices_fallback source=mock missing_securities={len(missing)} covered={len(covered)}",
+                flush=True,
+            )
+            mocked = self._build_mock_price_history(missing, start_date=start_date, end_date=end_date)
+            if live.empty:
+                return mocked
+            return (
+                pd.concat([live, mocked], ignore_index=True)
+                .sort_values(["security_id", "trade_date"])
+                .reset_index(drop=True)
+            )
+
+        if missing:
+            print(
+                f"[provider] prices_missing source=live_only missing_securities={len(missing)} covered={len(covered)}",
+                flush=True,
+            )
+
+        return live.sort_values(["security_id", "trade_date"]).reset_index(drop=True)
+
+    def _build_mock_price_history(
+        self,
+        securities: list[Security],
+        start_date: datetime,
+        end_date: datetime,
+    ) -> pd.DataFrame:
         rng = self._rng()
         days = pd.bdate_range(start=start_date.date(), end=end_date.date(), freq="C")
         rows: list[dict[str, object]] = []
@@ -340,6 +398,299 @@ class HybridDataProvider:
                 )
 
         return pd.DataFrame(rows)
+
+    @staticmethod
+    def _normalize_daily_frame(df: pd.DataFrame) -> pd.DataFrame:
+        required_cols = {
+            "security_id",
+            "market",
+            "trade_date",
+            "open_raw",
+            "high_raw",
+            "low_raw",
+            "close_raw",
+            "volume",
+            "adjusted_close",
+            "adjustment_factor",
+            "source",
+        }
+        if df.empty:
+            return pd.DataFrame(columns=sorted(required_cols))
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = np.nan
+        df = df[list(required_cols)].copy()
+        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+        return df
+
+    def _fetch_us_prices_massive(
+        self,
+        security: Security,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> pd.DataFrame:
+        client = MassiveClient(self.secrets.massive_api_key)
+        if not client.available():
+            return pd.DataFrame()
+
+        ticker = str(security.ticker).strip().upper()
+        endpoint = (
+            "https://api.polygon.io/v2/aggs/ticker/"
+            f"{ticker}/range/1/day/{start_date.date().isoformat()}/{end_date.date().isoformat()}"
+        )
+        payload = client.fetch(
+            endpoint,
+            params={
+                "adjusted": "true",
+                "sort": "asc",
+                "limit": 50000,
+            },
+        )
+        results = payload.get("results")
+        if not isinstance(results, list) or not results:
+            return pd.DataFrame()
+
+        rows: list[dict[str, object]] = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            ts_ms = item.get("t")
+            if ts_ms is None:
+                continue
+            trade_date = datetime.utcfromtimestamp(float(ts_ms) / 1000.0).date()
+            rows.append(
+                {
+                    "security_id": security.security_id,
+                    "market": security.market,
+                    "trade_date": trade_date,
+                    "open_raw": float(item.get("o") or 0.0),
+                    "high_raw": float(item.get("h") or 0.0),
+                    "low_raw": float(item.get("l") or 0.0),
+                    "close_raw": float(item.get("c") or 0.0),
+                    "volume": int(float(item.get("v") or 0.0)),
+                    "adjusted_close": float(item.get("c") or 0.0),
+                    "adjustment_factor": 1.0,
+                    "source": "massive",
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def _fetch_us_prices_stooq(
+        self,
+        security: Security,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> pd.DataFrame:
+        ticker = str(security.ticker).strip().lower()
+        if not ticker:
+            return pd.DataFrame()
+
+        candidates = [
+            f"{ticker}.us",
+            f"{ticker.replace('.', '-')}.us",
+            f"{ticker.replace('.', '')}.us",
+        ]
+        seen: set[str] = set()
+
+        for symbol in candidates:
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            text = resp.text.strip()
+            if not text or "No data" in text:
+                continue
+
+            raw = pd.read_csv(StringIO(text))
+            if raw.empty or "Date" not in raw.columns:
+                continue
+
+            raw["Date"] = pd.to_datetime(raw["Date"], errors="coerce")
+            raw = raw.dropna(subset=["Date"]).copy()
+            raw = raw[
+                (raw["Date"] >= pd.Timestamp(start_date.date()))
+                & (raw["Date"] <= pd.Timestamp(end_date.date()))
+            ]
+            if raw.empty:
+                continue
+
+            out = pd.DataFrame(
+                {
+                    "security_id": security.security_id,
+                    "market": security.market,
+                    "trade_date": raw["Date"].dt.date,
+                    "open_raw": pd.to_numeric(raw.get("Open"), errors="coerce"),
+                    "high_raw": pd.to_numeric(raw.get("High"), errors="coerce"),
+                    "low_raw": pd.to_numeric(raw.get("Low"), errors="coerce"),
+                    "close_raw": pd.to_numeric(raw.get("Close"), errors="coerce"),
+                    "volume": pd.to_numeric(raw.get("Volume"), errors="coerce").fillna(0).astype(int),
+                    "adjusted_close": pd.to_numeric(raw.get("Close"), errors="coerce"),
+                    "adjustment_factor": 1.0,
+                    "source": "stooq_us",
+                }
+            )
+            out = out.dropna(subset=["open_raw", "high_raw", "low_raw", "close_raw"])
+            if not out.empty:
+                return out.reset_index(drop=True)
+        return pd.DataFrame()
+
+    def _fetch_jp_prices_stooq(
+        self,
+        security: Security,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> pd.DataFrame:
+        ticker = str(security.ticker).strip()
+        if not ticker:
+            return pd.DataFrame()
+        symbol = f"{ticker.lower()}.jp"
+        url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        text = resp.text.strip()
+        if not text or "No data" in text:
+            return pd.DataFrame()
+
+        raw = pd.read_csv(StringIO(text))
+        if raw.empty or "Date" not in raw.columns:
+            return pd.DataFrame()
+        raw["Date"] = pd.to_datetime(raw["Date"], errors="coerce")
+        raw = raw.dropna(subset=["Date"]).copy()
+        raw = raw[(raw["Date"] >= pd.Timestamp(start_date.date())) & (raw["Date"] <= pd.Timestamp(end_date.date()))]
+        if raw.empty:
+            return pd.DataFrame()
+
+        out = pd.DataFrame(
+            {
+                "security_id": security.security_id,
+                "market": security.market,
+                "trade_date": raw["Date"].dt.date,
+                "open_raw": pd.to_numeric(raw.get("Open"), errors="coerce"),
+                "high_raw": pd.to_numeric(raw.get("High"), errors="coerce"),
+                "low_raw": pd.to_numeric(raw.get("Low"), errors="coerce"),
+                "close_raw": pd.to_numeric(raw.get("Close"), errors="coerce"),
+                "volume": pd.to_numeric(raw.get("Volume"), errors="coerce").fillna(0).astype(int),
+                "adjusted_close": pd.to_numeric(raw.get("Close"), errors="coerce"),
+                "adjustment_factor": 1.0,
+                "source": "stooq",
+            }
+        )
+        out = out.dropna(subset=["open_raw", "high_raw", "low_raw", "close_raw"])
+        return out.reset_index(drop=True)
+
+    def _fetch_jp_prices_jquants(
+        self,
+        security: Security,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> pd.DataFrame:
+        client = JQuantsClient(
+            api_key=self.secrets.jquants_api_key,
+            email=self.secrets.jquants_email,
+            password=self.secrets.jquants_password,
+        )
+        if not client.v2_available():
+            return pd.DataFrame()
+
+        rows = client.fetch_eq_bars_daily(
+            code=str(security.ticker),
+            start_date=start_date.date().isoformat(),
+            end_date=end_date.date().isoformat(),
+        )
+        if not rows:
+            return pd.DataFrame()
+
+        raw = pd.DataFrame(rows)
+        if raw.empty or "Date" not in raw.columns:
+            return pd.DataFrame()
+
+        raw["Date"] = pd.to_datetime(raw["Date"], errors="coerce")
+        raw = raw.dropna(subset=["Date"]).copy()
+        raw = raw[
+            (raw["Date"] >= pd.Timestamp(start_date.date()))
+            & (raw["Date"] <= pd.Timestamp(end_date.date()))
+        ]
+        if raw.empty:
+            return pd.DataFrame()
+
+        out = pd.DataFrame(
+            {
+                "security_id": security.security_id,
+                "market": security.market,
+                "trade_date": raw["Date"].dt.date,
+                "open_raw": pd.to_numeric(raw.get("O"), errors="coerce"),
+                "high_raw": pd.to_numeric(raw.get("H"), errors="coerce"),
+                "low_raw": pd.to_numeric(raw.get("L"), errors="coerce"),
+                "close_raw": pd.to_numeric(raw.get("C"), errors="coerce"),
+                "volume": pd.to_numeric(raw.get("Vo"), errors="coerce").fillna(0).astype(int),
+                "adjusted_close": pd.to_numeric(raw.get("AdjC"), errors="coerce"),
+                "adjustment_factor": pd.to_numeric(raw.get("AdjFactor"), errors="coerce").fillna(1.0),
+                "source": "jquants",
+            }
+        )
+        out["adjusted_close"] = out["adjusted_close"].fillna(out["close_raw"])
+        out = out.dropna(subset=["open_raw", "high_raw", "low_raw", "close_raw"])
+        return out.reset_index(drop=True)
+
+    def _load_price_history_live(
+        self,
+        securities: list[Security],
+        start_date: datetime,
+        end_date: datetime,
+    ) -> pd.DataFrame:
+        if not securities:
+            return pd.DataFrame()
+
+        us = [s for s in securities if s.market == "US"]
+        jp = [s for s in securities if s.market == "JP"]
+
+        frames: list[pd.DataFrame] = []
+        us_success = 0
+        jp_success = 0
+
+        def _safe_fetch_us(sec: Security) -> pd.DataFrame:
+            try:
+                df = self._fetch_us_prices_stooq(sec, start_date, end_date)
+                if not df.empty:
+                    return df
+                return self._fetch_us_prices_massive(sec, start_date, end_date)
+            except Exception:
+                return pd.DataFrame()
+
+        def _safe_fetch_jp(sec: Security) -> pd.DataFrame:
+            try:
+                df = self._fetch_jp_prices_jquants(sec, start_date, end_date)
+                if not df.empty:
+                    return df
+                return self._fetch_jp_prices_stooq(sec, start_date, end_date)
+            except Exception:
+                return pd.DataFrame()
+
+        for sec in jp:
+            df = _safe_fetch_jp(sec)
+            if not df.empty:
+                jp_success += 1
+                frames.append(df)
+
+        for sec in us:
+            df = _safe_fetch_us(sec)
+            if not df.empty:
+                us_success += 1
+                frames.append(df)
+
+        if not frames:
+            print("[provider] prices_live source=none count=0", flush=True)
+            return pd.DataFrame()
+
+        merged = pd.concat(frames, ignore_index=True)
+        merged = self._normalize_daily_frame(merged)
+        print(
+            f"[provider] prices_live source=jquants+stooq+massive rows={len(merged)} us_ok={us_success}/{len(us)} jp_ok={jp_success}/{len(jp)}",
+            flush=True,
+        )
+        return merged
 
     def load_usdjpy(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
         rng = self._rng()

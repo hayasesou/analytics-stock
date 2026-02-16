@@ -156,3 +156,72 @@ export type WeeklyActionData = {
   strictMetric: WeeklyStrictMetric;
   signalDiagnostics: WeeklySignalDiagnostic[];
 };
+
+export type ExecutionOrderIntent = {
+  intentId: string;
+  portfolioId: string;
+  portfolioName: string;
+  strategyVersionId: string | null;
+  asOf: string;
+  status: "proposed" | "approved" | "rejected" | "sent" | "executing" | "done" | "failed" | "canceled";
+  reason: string | null;
+  riskChecks: Record<string, unknown>;
+  targetPositions: unknown[];
+  createdAt: string;
+  approvedAt: string | null;
+  approvedBy: string | null;
+};
+
+export type ExecutionRiskSnapshot = {
+  portfolioId: string;
+  portfolioName: string;
+  asOf: string;
+  equity: number;
+  drawdown: number;
+  sharpe20d: number | null;
+  grossExposure: number | null;
+  netExposure: number | null;
+  state: "normal" | "risk_alert" | "halted";
+  triggers: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type ResearchStrategy = {
+  strategyId: string;
+  strategyName: string;
+  assetScope: "JP_EQ" | "US_EQ" | "CRYPTO" | "MIXED";
+  status: "draft" | "candidate" | "approved" | "paper" | "live" | "paused" | "retired";
+  updatedAt: string;
+  versionId: string | null;
+  version: number | null;
+  evalType: "quick_backtest" | "robust_backtest" | "paper" | "live" | null;
+  sharpe: number | null;
+  maxDd: number | null;
+  cagr: number | null;
+};
+
+export type ResearchFundamentalSnapshot = {
+  securityId: string;
+  ticker: string;
+  name: string;
+  market: "JP" | "US";
+  source: string;
+  asOfDate: string;
+  rating: "A" | "B" | "C";
+  confidence: "High" | "Medium" | "Low" | null;
+  summary: string;
+  createdAt: string;
+};
+
+export type ResearchAgentTask = {
+  id: string;
+  taskType: string;
+  priority: number;
+  status: "queued" | "running" | "success" | "failed" | "canceled";
+  strategyName: string | null;
+  securityId: string | null;
+  costUsd: number | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+};

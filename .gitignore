@@ -10,6 +10,11 @@ worker/.pytest_cache/
 worker/.mypy_cache/
 worker/__pycache__/
 worker/**/*.pyc
+worker/build/
+worker/dist/
+worker/*.egg-info/
+worker/**/*.egg-info/
+source
 
 # Runtime artifacts
 *.log
