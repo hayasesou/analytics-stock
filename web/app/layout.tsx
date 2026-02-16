@@ -18,6 +18,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <Link href="/top50">Top50</Link>
               <Link href="/reports/weekly">週間サマリ</Link>
               <Link href="/backtest">バックテスト</Link>
+              <Link href="/execution">執行監視</Link>
+              <Link href="/research">研究管理</Link>
               <Link href="/events">日次イベント</Link>
               <Link href="/chat">質問チャット</Link>
             </nav>

@@ -327,3 +327,175 @@ CREATE TABLE IF NOT EXISTS chat_message_citations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_message_citations_msg ON chat_message_citations (message_id);
+
+CREATE TABLE IF NOT EXISTS strategies (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL UNIQUE,
+  description TEXT,
+  asset_scope TEXT NOT NULL CHECK (asset_scope IN ('JP_EQ', 'US_EQ', 'CRYPTO', 'MIXED')),
+  status TEXT NOT NULL CHECK (status IN ('draft', 'candidate', 'approved', 'paper', 'live', 'paused', 'retired')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies (status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS strategy_versions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  strategy_id UUID NOT NULL REFERENCES strategies(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL CHECK (version >= 1),
+  spec JSONB NOT NULL,
+  code_artifact_key TEXT,
+  sha256 CHAR(64),
+  created_by TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  approved_by TEXT,
+  approved_at TIMESTAMPTZ,
+  is_active BOOLEAN NOT NULL DEFAULT FALSE,
+  UNIQUE (strategy_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_versions_active
+  ON strategy_versions (strategy_id, is_active, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS strategy_evaluations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  strategy_version_id UUID NOT NULL REFERENCES strategy_versions(id) ON DELETE CASCADE,
+  eval_type TEXT NOT NULL CHECK (eval_type IN ('quick_backtest', 'robust_backtest', 'paper', 'live')),
+  period_start DATE NOT NULL,
+  period_end DATE NOT NULL,
+  metrics JSONB NOT NULL,
+  artifacts JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_evaluations_type_time
+  ON strategy_evaluations (eval_type, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS portfolios (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL UNIQUE,
+  base_currency TEXT NOT NULL,
+  broker_map JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS order_intents (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  portfolio_id UUID NOT NULL REFERENCES portfolios(id) ON DELETE CASCADE,
+  strategy_version_id UUID REFERENCES strategy_versions(id) ON DELETE SET NULL,
+  as_of TIMESTAMPTZ NOT NULL,
+  target_positions JSONB NOT NULL,
+  reason TEXT,
+  risk_checks JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL CHECK (status IN ('proposed', 'approved', 'rejected', 'sent', 'executing', 'done', 'failed', 'canceled')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  approved_at TIMESTAMPTZ,
+  approved_by TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_intents_status_time
+  ON order_intents (status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS orders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  intent_id UUID REFERENCES order_intents(id) ON DELETE SET NULL,
+  broker TEXT NOT NULL,
+  account_id TEXT,
+  symbol TEXT NOT NULL,
+  instrument_type TEXT NOT NULL CHECK (instrument_type IN ('JP_EQ', 'US_EQ', 'CRYPTO', 'FUT', 'FX', 'ETF')),
+  side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL', 'SELL_SHORT', 'BUY_TO_COVER')),
+  order_type TEXT NOT NULL CHECK (order_type IN ('MKT', 'LMT', 'STOP', 'STP_LMT')),
+  qty NUMERIC(18, 8) NOT NULL,
+  limit_price NUMERIC(18, 8),
+  stop_price NUMERIC(18, 8),
+  time_in_force TEXT NOT NULL DEFAULT 'DAY',
+  status TEXT NOT NULL CHECK (status IN ('new', 'sent', 'ack', 'partially_filled', 'filled', 'canceled', 'rejected', 'expired', 'error')),
+  broker_order_id TEXT,
+  idempotency_key TEXT NOT NULL,
+  submitted_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+  UNIQUE (broker, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_orders_status_time ON orders (status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS order_fills (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  fill_time TIMESTAMPTZ NOT NULL,
+  qty NUMERIC(18, 8) NOT NULL,
+  price NUMERIC(18, 8) NOT NULL,
+  fee NUMERIC(18, 8) NOT NULL DEFAULT 0,
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_fills_time ON order_fills (fill_time DESC);
+
+CREATE TABLE IF NOT EXISTS positions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  portfolio_id UUID NOT NULL REFERENCES portfolios(id) ON DELETE CASCADE,
+  symbol TEXT NOT NULL,
+  instrument_type TEXT NOT NULL CHECK (instrument_type IN ('JP_EQ', 'US_EQ', 'CRYPTO', 'FUT', 'FX', 'ETF')),
+  qty NUMERIC(18, 8) NOT NULL,
+  avg_price NUMERIC(18, 8),
+  last_price NUMERIC(18, 8),
+  market_value NUMERIC(18, 8),
+  unrealized_pnl NUMERIC(18, 8),
+  realized_pnl NUMERIC(18, 8),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (portfolio_id, symbol, instrument_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_portfolio_symbol ON positions (portfolio_id, symbol);
+
+CREATE TABLE IF NOT EXISTS risk_snapshots (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  portfolio_id UUID NOT NULL REFERENCES portfolios(id) ON DELETE CASCADE,
+  as_of TIMESTAMPTZ NOT NULL,
+  equity NUMERIC(18, 8) NOT NULL,
+  drawdown NUMERIC(10, 6) NOT NULL,
+  sharpe_20d NUMERIC(10, 6),
+  gross_exposure NUMERIC(18, 8),
+  net_exposure NUMERIC(18, 8),
+  state TEXT NOT NULL CHECK (state IN ('normal', 'risk_alert', 'halted')),
+  triggers JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (portfolio_id, as_of)
+);
+
+CREATE INDEX IF NOT EXISTS idx_risk_snapshots_portfolio_time
+  ON risk_snapshots (portfolio_id, as_of DESC);
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_type TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 100,
+  status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'success', 'failed', 'canceled')),
+  payload JSONB NOT NULL,
+  result JSONB NOT NULL DEFAULT '{}'::jsonb,
+  cost_usd NUMERIC(12, 4),
+  started_at TIMESTAMPTZ,
+  finished_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_queue ON agent_tasks (status, priority, created_at);
+
+CREATE TABLE IF NOT EXISTS fundamental_snapshots (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  security_id UUID NOT NULL REFERENCES securities(id) ON DELETE CASCADE,
+  as_of_date DATE NOT NULL,
+  source TEXT NOT NULL DEFAULT 'llm',
+  rating TEXT NOT NULL CHECK (rating IN ('A', 'B', 'C')),
+  confidence TEXT CHECK (confidence IN ('High', 'Medium', 'Low')),
+  summary TEXT NOT NULL,
+  snapshot JSONB NOT NULL,
+  created_by TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (security_id, as_of_date, source)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fundamental_snapshots_time
+  ON fundamental_snapshots (as_of_date DESC, rating);

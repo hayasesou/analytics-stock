@@ -183,3 +183,63 @@ data_sources:
     - tdnet_scraping
     - edinet_api
   us_disclosure: sec_edgar
+
+data_quality:
+  weekly:
+    enabled: true
+    lookback_days: 14
+    min_coverage_ratio:
+      JP: 0.90
+      US: 0.90
+
+strategy_factory:
+  enabled: true
+  max_parallel_tasks: 5
+  candidate_limit: 20
+  escalation:
+    lightweight_model: gpt-5-mini
+    heavy_model: gpt-5-pro
+  agent_roles:
+    - strategy_design
+    - coding
+    - feature_engineering
+    - risk_evaluation
+    - orchestration
+  candidate_gate:
+    require_robust_backtest: true
+    require_manual_approval_to_live: true
+  fundamental_overlay:
+    enabled: true
+    screening_allow_ratings:
+      - A
+      - B
+    screening_pass_status: candidate
+    screening_block_status: draft
+
+execution:
+  data_quality:
+    enabled: true
+    reject_on_missing_price: true
+    max_price_staleness_days:
+      JP: 7
+      US: 7
+      CRYPTO: 2
+  risk_gate:
+    max_drawdown_breach: -0.03
+    min_sharpe_20d: 0.0
+    rolling_sharpe_window_days: 20
+  fundamental_overlay:
+    enabled: true
+    allow_if_missing: true
+    trade_allow_ratings:
+      - A
+      - B
+    size_multiplier_by_rating:
+      A: 1.0
+      B: 0.6
+      C: 0.0
+  order_controls:
+    idempotency_required: true
+    enforce_pretrade_checks: true
+  deployment:
+    allow_auto_promotion_to_live: false

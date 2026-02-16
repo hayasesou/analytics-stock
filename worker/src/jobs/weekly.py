@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import os
 from time import perf_counter
 import traceback
+from typing import Any
 
 import pandas as pd
 
@@ -24,7 +25,7 @@ from src.llm.reporting import (
 )
 from src.storage.db import NeonRepository
 from src.storage.r2 import R2Storage
-from src.types import CitationItem, ReportItem
+from src.types import CitationItem, ReportItem, Security
 
 EVIDENCE_LOOKBACK_DAYS = 30
 SECURITY_REPORT_CITATION_LIMIT = 3
@@ -188,6 +189,117 @@ def _env_float(name: str, default: float, minimum: float) -> float:
     return max(value, minimum)
 
 
+def _resolve_weekly_data_quality_policy(cfg: dict[str, Any]) -> dict[str, Any]:
+    dq_root = cfg.get("data_quality", {})
+    if not isinstance(dq_root, dict):
+        dq_root = {}
+    weekly_cfg = dq_root.get("weekly", {})
+    if not isinstance(weekly_cfg, dict):
+        weekly_cfg = {}
+
+    lookback_days_raw = weekly_cfg.get("lookback_days", 14)
+    try:
+        lookback_days = max(1, int(lookback_days_raw))
+    except (TypeError, ValueError):
+        lookback_days = 14
+
+    min_cov_raw = weekly_cfg.get("min_coverage_ratio", {"JP": 0.8, "US": 0.8})
+    if not isinstance(min_cov_raw, dict):
+        min_cov_raw = {"JP": 0.8, "US": 0.8}
+    min_coverage_ratio: dict[str, float] = {}
+    for market, ratio in min_cov_raw.items():
+        try:
+            min_coverage_ratio[str(market).strip().upper()] = max(0.0, min(1.0, float(ratio)))
+        except (TypeError, ValueError):
+            continue
+    if not min_coverage_ratio:
+        min_coverage_ratio = {"JP": 0.8, "US": 0.8}
+
+    return {
+        "enabled": bool(weekly_cfg.get("enabled", True)),
+        "lookback_days": lookback_days,
+        "min_coverage_ratio": min_coverage_ratio,
+    }
+
+
+def _compute_market_price_coverage(
+    securities: list[Security],
+    prices: pd.DataFrame,
+    as_of_date: date,
+    lookback_days: int,
+) -> dict[str, dict[str, Any]]:
+    by_market_expected: dict[str, set[str]] = {}
+    for sec in securities:
+        market = str(sec.market).strip().upper()
+        by_market_expected.setdefault(market, set()).add(str(sec.security_id))
+
+    if prices.empty:
+        return {
+            market: {
+                "total": len(expected),
+                "covered": 0,
+                "coverage_ratio": 0.0 if expected else 1.0,
+                "latest_trade_date": None,
+            }
+            for market, expected in by_market_expected.items()
+        }
+
+    df = prices.copy()
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce").dt.date
+    df["market"] = df["market"].astype(str).str.upper()
+    cutoff = as_of_date - timedelta(days=max(1, int(lookback_days)))
+    recent = df[df["trade_date"] >= cutoff].copy()
+
+    out: dict[str, dict[str, Any]] = {}
+    for market, expected in by_market_expected.items():
+        market_recent = recent[recent["market"] == market]
+        covered_ids = set(market_recent["security_id"].astype(str).tolist()) & expected
+        total = len(expected)
+        covered = len(covered_ids)
+        ratio = (covered / total) if total > 0 else 1.0
+        latest_trade_date = None
+        if not market_recent.empty:
+            latest_trade_date = market_recent["trade_date"].max()
+            if isinstance(latest_trade_date, pd.Timestamp):
+                latest_trade_date = latest_trade_date.date()
+        out[market] = {
+            "total": total,
+            "covered": covered,
+            "coverage_ratio": float(ratio),
+            "latest_trade_date": latest_trade_date.isoformat() if latest_trade_date else None,
+        }
+    return out
+
+
+def _enforce_weekly_data_quality(
+    policy: dict[str, Any],
+    coverage: dict[str, dict[str, Any]],
+) -> None:
+    if not bool(policy.get("enabled", True)):
+        return
+    thresholds = policy.get("min_coverage_ratio", {})
+    if not isinstance(thresholds, dict):
+        return
+
+    breaches: list[str] = []
+    for market, min_ratio_raw in thresholds.items():
+        market_key = str(market).strip().upper()
+        metrics = coverage.get(market_key)
+        if not metrics:
+            continue
+        total = int(metrics.get("total", 0) or 0)
+        if total <= 0:
+            continue
+        ratio = float(metrics.get("coverage_ratio", 0.0) or 0.0)
+        min_ratio = float(min_ratio_raw)
+        if ratio < min_ratio:
+            breaches.append(f"{market_key}:{ratio:.3f}<{min_ratio:.3f}")
+
+    if breaches:
+        joined = ", ".join(breaches)
+        raise RuntimeError(f"weekly data quality gate failed: {joined}")
+
+
 def run_weekly() -> str:
     run_started = perf_counter()
     print("[weekly] start preparing job", flush=True)
@@ -234,6 +346,23 @@ def run_weekly() -> str:
         prices = provider.load_price_history(securities, start, now)
         stage_started = _log_stage("load_price_history", stage_started, run_started, extra=f"rows={len(prices)}")
 
+        dq_policy = _resolve_weekly_data_quality_policy(cfg)
+        dq_coverage = _compute_market_price_coverage(
+            securities=securities,
+            prices=prices,
+            as_of_date=now.date(),
+            lookback_days=int(dq_policy["lookback_days"]),
+        )
+        _enforce_weekly_data_quality(dq_policy, dq_coverage)
+        dq_extra = ", ".join(
+            [
+                f"{m}={int(v.get('covered', 0))}/{int(v.get('total', 0))}({float(v.get('coverage_ratio', 0.0)):.2f})"
+                for m, v in sorted(dq_coverage.items())
+            ]
+        )
+        stage_started = _log_stage("data_quality", stage_started, run_started, extra=dq_extra)
+
+        repo.delete_prices_range(list(sec_map.values()), start.date(), now.date())
         repo.upsert_prices(prices, sec_map)
         stage_started = _log_stage("upsert_prices", stage_started, run_started, extra=f"rows={len(prices)}")
 
@@ -518,6 +647,8 @@ def run_weekly() -> str:
                 "llm_security_calls": llm_security_calls,
                 "llm_security_failures": llm_security_consecutive_failures,
                 "llm_security_runtime_enabled_end": llm_security_reports_runtime_enabled,
+                "data_quality_policy": dq_policy,
+                "data_quality_coverage": dq_coverage,
             },
         )
         _log_stage("finish_run", stage_started, run_started)

@@ -5,7 +5,12 @@ import type {
   BacktestMetric,
   BacktestPoint,
   CitationRecord,
+  ExecutionOrderIntent,
+  ExecutionRiskSnapshot,
   EventRecord,
+  ResearchAgentTask,
+  ResearchFundamentalSnapshot,
+  ResearchStrategy,
   ReportRecord,
   SecurityIdentity,
   SecurityTimelineData,
@@ -44,6 +49,13 @@ function clampLookupLimit(limit: number): number {
     return 5;
   }
   return Math.min(20, Math.max(1, Math.trunc(limit)));
+}
+
+function clampExecutionLimit(limit: number): number {
+  if (!Number.isFinite(limit)) {
+    return 50;
+  }
+  return Math.min(200, Math.max(1, Math.trunc(limit)));
 }
 
 function mapSecurityIdentityRow(row: {
@@ -921,6 +933,355 @@ export async function fetchBacktestData(): Promise<{
     })),
     curve
   };
+}
+
+export async function fetchExecutionOrderIntents(input?: {
+  status?: ExecutionOrderIntent["status"] | null;
+  portfolioName?: string | null;
+  limit?: number | null;
+}): Promise<ExecutionOrderIntent[]> {
+  const sql = getSql();
+  const status = input?.status ?? null;
+  const portfolioName = input?.portfolioName?.trim() || null;
+  const limit = clampExecutionLimit(input?.limit ?? 50);
+
+  try {
+    const rows = await sql<
+      {
+        intent_id: string;
+        portfolio_id: string;
+        portfolio_name: string;
+        strategy_version_id: string | null;
+        as_of: string;
+        status: ExecutionOrderIntent["status"];
+        reason: string | null;
+        risk_checks: Record<string, unknown> | null;
+        target_positions: unknown[] | null;
+        created_at: string;
+        approved_at: string | null;
+        approved_by: string | null;
+      }[]
+    >`
+      select
+        oi.id::text as intent_id,
+        oi.portfolio_id::text as portfolio_id,
+        p.name as portfolio_name,
+        oi.strategy_version_id::text as strategy_version_id,
+        oi.as_of::text as as_of,
+        oi.status,
+        oi.reason,
+        oi.risk_checks,
+        oi.target_positions,
+        oi.created_at::text as created_at,
+        oi.approved_at::text as approved_at,
+        oi.approved_by
+      from order_intents oi
+      join portfolios p on p.id = oi.portfolio_id
+      where (${status}::text is null or oi.status = ${status})
+        and (${portfolioName}::text is null or p.name = ${portfolioName})
+      order by oi.created_at desc
+      limit ${limit}
+    `;
+
+    return rows.map((r) => ({
+      intentId: r.intent_id,
+      portfolioId: r.portfolio_id,
+      portfolioName: r.portfolio_name,
+      strategyVersionId: r.strategy_version_id,
+      asOf: r.as_of,
+      status: r.status,
+      reason: r.reason,
+      riskChecks: r.risk_checks ?? {},
+      targetPositions: Array.isArray(r.target_positions) ? r.target_positions : [],
+      createdAt: r.created_at,
+      approvedAt: r.approved_at,
+      approvedBy: r.approved_by
+    }));
+  } catch (error) {
+    if (
+      isUndefinedRelationError(error, "order_intents") ||
+      isUndefinedRelationError(error, "portfolios")
+    ) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function fetchExecutionRiskSnapshots(input?: {
+  portfolioName?: string | null;
+  limit?: number | null;
+}): Promise<ExecutionRiskSnapshot[]> {
+  const sql = getSql();
+  const portfolioName = input?.portfolioName?.trim() || null;
+  const limit = clampExecutionLimit(input?.limit ?? 50);
+
+  try {
+    const rows = await sql<
+      {
+        portfolio_id: string;
+        portfolio_name: string;
+        as_of: string;
+        equity: number;
+        drawdown: number;
+        sharpe_20d: number | null;
+        gross_exposure: number | null;
+        net_exposure: number | null;
+        state: ExecutionRiskSnapshot["state"];
+        triggers: Record<string, unknown> | null;
+        created_at: string;
+      }[]
+    >`
+      select
+        rs.portfolio_id::text as portfolio_id,
+        p.name as portfolio_name,
+        rs.as_of::text as as_of,
+        rs.equity,
+        rs.drawdown,
+        rs.sharpe_20d,
+        rs.gross_exposure,
+        rs.net_exposure,
+        rs.state,
+        rs.triggers,
+        rs.created_at::text as created_at
+      from risk_snapshots rs
+      join portfolios p on p.id = rs.portfolio_id
+      where (${portfolioName}::text is null or p.name = ${portfolioName})
+      order by rs.as_of desc
+      limit ${limit}
+    `;
+
+    return rows.map((r) => ({
+      portfolioId: r.portfolio_id,
+      portfolioName: r.portfolio_name,
+      asOf: r.as_of,
+      equity: Number(r.equity ?? 0),
+      drawdown: Number(r.drawdown ?? 0),
+      sharpe20d: r.sharpe_20d == null ? null : Number(r.sharpe_20d),
+      grossExposure: r.gross_exposure == null ? null : Number(r.gross_exposure),
+      netExposure: r.net_exposure == null ? null : Number(r.net_exposure),
+      state: r.state,
+      triggers: r.triggers ?? {},
+      createdAt: r.created_at
+    }));
+  } catch (error) {
+    if (
+      isUndefinedRelationError(error, "risk_snapshots") ||
+      isUndefinedRelationError(error, "portfolios")
+    ) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function fetchResearchStrategies(input?: {
+  status?: ResearchStrategy["status"] | null;
+  limit?: number | null;
+}): Promise<ResearchStrategy[]> {
+  const sql = getSql();
+  const status = input?.status ?? null;
+  const limit = clampExecutionLimit(input?.limit ?? 50);
+
+  try {
+    const rows = await sql<
+      {
+        strategy_id: string;
+        strategy_name: string;
+        asset_scope: ResearchStrategy["assetScope"];
+        status: ResearchStrategy["status"];
+        updated_at: string;
+        version_id: string | null;
+        version: number | null;
+        eval_type: ResearchStrategy["evalType"];
+        sharpe: number | null;
+        max_dd: number | null;
+        cagr: number | null;
+      }[]
+    >`
+      with latest_versions as (
+        select distinct on (sv.strategy_id)
+          sv.strategy_id,
+          sv.id::text as version_id,
+          sv.version
+        from strategy_versions sv
+        order by sv.strategy_id, sv.version desc
+      ),
+      latest_eval as (
+        select distinct on (se.strategy_version_id)
+          se.strategy_version_id,
+          se.eval_type,
+          nullif(se.metrics->>'sharpe', '')::double precision as sharpe,
+          nullif(se.metrics->>'max_dd', '')::double precision as max_dd,
+          nullif(se.metrics->>'cagr', '')::double precision as cagr
+        from strategy_evaluations se
+        order by se.strategy_version_id, se.created_at desc
+      )
+      select
+        s.id::text as strategy_id,
+        s.name as strategy_name,
+        s.asset_scope,
+        s.status,
+        s.updated_at::text as updated_at,
+        lv.version_id,
+        lv.version,
+        le.eval_type,
+        le.sharpe,
+        le.max_dd,
+        le.cagr
+      from strategies s
+      left join latest_versions lv on lv.strategy_id = s.id
+      left join latest_eval le on le.strategy_version_id = lv.version_id::uuid
+      where (${status}::text is null or s.status = ${status})
+      order by s.updated_at desc
+      limit ${limit}
+    `;
+
+    return rows.map((r) => ({
+      strategyId: r.strategy_id,
+      strategyName: r.strategy_name,
+      assetScope: r.asset_scope,
+      status: r.status,
+      updatedAt: r.updated_at,
+      versionId: r.version_id,
+      version: r.version,
+      evalType: r.eval_type,
+      sharpe: r.sharpe == null ? null : Number(r.sharpe),
+      maxDd: r.max_dd == null ? null : Number(r.max_dd),
+      cagr: r.cagr == null ? null : Number(r.cagr)
+    }));
+  } catch (error) {
+    if (
+      isUndefinedRelationError(error, "strategies") ||
+      isUndefinedRelationError(error, "strategy_versions") ||
+      isUndefinedRelationError(error, "strategy_evaluations")
+    ) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function fetchResearchFundamentalSnapshots(input?: {
+  rating?: ResearchFundamentalSnapshot["rating"] | null;
+  limit?: number | null;
+}): Promise<ResearchFundamentalSnapshot[]> {
+  const sql = getSql();
+  const rating = input?.rating ?? null;
+  const limit = clampExecutionLimit(input?.limit ?? 50);
+
+  try {
+    const rows = await sql<
+      {
+        security_id: string;
+        ticker: string;
+        name: string;
+        market: "JP" | "US";
+        source: string;
+        as_of_date: string;
+        rating: "A" | "B" | "C";
+        confidence: "High" | "Medium" | "Low" | null;
+        summary: string;
+        created_at: string;
+      }[]
+    >`
+      select
+        s.security_id,
+        s.ticker,
+        coalesce(s.name, s.security_id) as name,
+        s.market,
+        fs.source,
+        fs.as_of_date::text as as_of_date,
+        fs.rating,
+        fs.confidence,
+        fs.summary,
+        fs.created_at::text as created_at
+      from fundamental_snapshots fs
+      join securities s on s.id = fs.security_id
+      where (${rating}::text is null or fs.rating = ${rating})
+      order by fs.as_of_date desc, fs.created_at desc
+      limit ${limit}
+    `;
+
+    return rows.map((r) => ({
+      securityId: r.security_id,
+      ticker: r.ticker,
+      name: r.name,
+      market: r.market,
+      source: r.source,
+      asOfDate: r.as_of_date,
+      rating: r.rating,
+      confidence: r.confidence,
+      summary: r.summary,
+      createdAt: r.created_at
+    }));
+  } catch (error) {
+    if (
+      isUndefinedRelationError(error, "fundamental_snapshots") ||
+      isUndefinedRelationError(error, "securities")
+    ) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function fetchResearchAgentTasks(input?: {
+  status?: ResearchAgentTask["status"] | null;
+  limit?: number | null;
+}): Promise<ResearchAgentTask[]> {
+  const sql = getSql();
+  const status = input?.status ?? null;
+  const limit = clampExecutionLimit(input?.limit ?? 50);
+
+  try {
+    const rows = await sql<
+      {
+        id: string;
+        task_type: string;
+        priority: number;
+        status: ResearchAgentTask["status"];
+        payload: Record<string, unknown> | null;
+        cost_usd: number | null;
+        created_at: string;
+        started_at: string | null;
+        finished_at: string | null;
+      }[]
+    >`
+      select
+        id::text,
+        task_type,
+        priority,
+        status,
+        payload,
+        cost_usd,
+        created_at::text as created_at,
+        started_at::text as started_at,
+        finished_at::text as finished_at
+      from agent_tasks
+      where (${status}::text is null or status = ${status})
+      order by created_at desc
+      limit ${limit}
+    `;
+
+    return rows.map((r) => ({
+      id: r.id,
+      taskType: r.task_type,
+      priority: Number(r.priority ?? 0),
+      status: r.status,
+      strategyName: typeof r.payload?.strategy_name === "string" ? r.payload.strategy_name : null,
+      securityId: typeof r.payload?.security_id === "string" ? r.payload.security_id : null,
+      costUsd: r.cost_usd == null ? null : Number(r.cost_usd),
+      createdAt: r.created_at,
+      startedAt: r.started_at,
+      finishedAt: r.finished_at
+    }));
+  } catch (error) {
+    if (isUndefinedRelationError(error, "agent_tasks")) {
+      return [];
+    }
+    throw error;
+  }
 }
 
 export async function createChatSessionIfNeeded(sessionId?: string): Promise<string> {
