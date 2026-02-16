@@ -99,6 +99,15 @@ docker compose --profile jobs run --rm worker-research
   - EDINET: documents list API（`EDINET_API_KEY` 任意）
 - live で1件も取得できない場合はイベントを0件として扱います（mock イベントは生成しません）。
 
+## 価格データ品質ゲート（実運用向け）
+
+- `weekly`:
+  - `data_quality.weekly` で市場ごとの最低カバレッジ比率を強制します。
+  - 例: `JP/US` の 14日内カバレッジが閾値未満なら `weekly` を `failed` にします。
+- `executor`:
+  - `execution.data_quality` で発注時の価格鮮度をチェックします。
+  - `reject_on_missing_price: true` かつ stale の場合、対象ポジションは自動除外され、意図注文は `rejected` になります。
+
 ## LLM 生成（任意）
 
 - 週次の `security_full` レポート本文生成を OpenAI で有効化できます。

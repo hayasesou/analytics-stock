@@ -110,6 +110,61 @@ def _resolve_fundamental_overlay(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _resolve_executor_data_quality(cfg: dict[str, Any]) -> dict[str, Any]:
+    execution_cfg = cfg.get("execution", {})
+    dq_cfg = execution_cfg.get("data_quality", {})
+    if not isinstance(dq_cfg, dict):
+        dq_cfg = {}
+    staleness_cfg = dq_cfg.get("max_price_staleness_days", {})
+    if not isinstance(staleness_cfg, dict):
+        staleness_cfg = {}
+    max_staleness_days: dict[str, int] = {}
+    defaults = {"JP": 7, "US": 7, "CRYPTO": 2}
+    for market_key, default_days in defaults.items():
+        raw = staleness_cfg.get(market_key, default_days)
+        try:
+            max_staleness_days[market_key] = max(0, int(raw))
+        except (TypeError, ValueError):
+            max_staleness_days[market_key] = default_days
+    return {
+        "enabled": bool(dq_cfg.get("enabled", False)),
+        "reject_on_missing_price": bool(dq_cfg.get("reject_on_missing_price", True)),
+        "max_staleness_days": max_staleness_days,
+    }
+
+
+def _price_row_is_stale(
+    latest_price_row: dict[str, Any] | None,
+    market_key: str,
+    now: datetime,
+    max_staleness_days: dict[str, int],
+) -> bool:
+    if not latest_price_row:
+        return True
+    trade_date_value = latest_price_row.get("trade_date")
+    trade_date = None
+    if isinstance(trade_date_value, datetime):
+        trade_date = trade_date_value.date()
+    elif hasattr(trade_date_value, "year") and hasattr(trade_date_value, "month") and hasattr(trade_date_value, "day"):
+        # date-like object
+        try:
+            trade_date = trade_date_value
+        except Exception:  # noqa: BLE001
+            trade_date = None
+    elif trade_date_value is not None:
+        text = str(trade_date_value).strip()
+        if text:
+            try:
+                trade_date = datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+            except ValueError:
+                trade_date = None
+    if trade_date is None:
+        return True
+    days_old = (now.date() - trade_date).days
+    allowed = int(max_staleness_days.get(market_key, 7))
+    return days_old > allowed
+
+
 def _compute_sharpe_from_history(
     history_rows: list[dict[str, Any]],
     window_days: int,
@@ -174,6 +229,7 @@ def run_executor_once(limit: int = 20) -> dict[str, int]:
     thresholds = _resolve_thresholds(cfg)
     sharpe_window_days = _resolve_sharpe_window_days(cfg)
     fundamental_overlay = _resolve_fundamental_overlay(cfg)
+    data_quality = _resolve_executor_data_quality(cfg)
     secrets = load_runtime_secrets()
     repo = NeonRepository(secrets.database_url)
     now = datetime.now(timezone.utc)
@@ -186,6 +242,7 @@ def run_executor_once(limit: int = 20) -> dict[str, int]:
         "rejected": 0,
         "failed": 0,
         "skipped_by_fundamental": 0,
+        "skipped_by_data_quality": 0,
     }
     for intent in intents:
         stats["processed"] += 1
@@ -233,8 +290,10 @@ def run_executor_once(limit: int = 20) -> dict[str, int]:
         fills: list[FillRecord] = []
         positions: list[PositionRecord] = []
         fill_price_by_symbol: dict[str, float] = {}
+        latest_price_cache: dict[str, dict[str, Any] | None] = {}
         error_count = 0
         filtered_count = 0
+        data_quality_filtered_count = 0
 
         for position in target_positions:
             if not isinstance(position, dict):
@@ -278,7 +337,29 @@ def run_executor_once(limit: int = 20) -> dict[str, int]:
             if delta_qty < 0:
                 side = "SELL_SHORT" if target_qty < 0 else "SELL"
 
-            latest_price_row = repo.fetch_latest_price_for_symbol(symbol)
+            if symbol in latest_price_cache:
+                latest_price_row = latest_price_cache[symbol]
+            else:
+                latest_price_row = repo.fetch_latest_price_for_symbol(symbol)
+                latest_price_cache[symbol] = latest_price_row
+
+            if bool(data_quality.get("enabled", True)):
+                reject_on_missing = bool(data_quality.get("reject_on_missing_price", True))
+                if latest_price_row is None:
+                    if reject_on_missing:
+                        data_quality_filtered_count += 1
+                        stats["skipped_by_data_quality"] += 1
+                        continue
+                elif _price_row_is_stale(
+                    latest_price_row=latest_price_row,
+                    market_key=market_key,
+                    now=now,
+                    max_staleness_days=dict(data_quality.get("max_staleness_days", {})),
+                ):
+                    data_quality_filtered_count += 1
+                    stats["skipped_by_data_quality"] += 1
+                    continue
+
             if not latest_price_row:
                 error_count += 1
                 continue
@@ -321,7 +402,7 @@ def run_executor_once(limit: int = 20) -> dict[str, int]:
             )
 
         if not orders:
-            if filtered_count > 0 and error_count == 0:
+            if (filtered_count + data_quality_filtered_count) > 0 and error_count == 0:
                 repo.update_order_intent_status(intent_id, "rejected")
                 stats["rejected"] += 1
             else:
