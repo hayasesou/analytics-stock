@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from types import SimpleNamespace
 
 from src.jobs import executor as executor_job
@@ -163,3 +164,46 @@ def test_run_executor_once_rejects_by_fundamental_overlay(monkeypatch):
     assert stats["skipped_by_fundamental"] == 1
     assert fake_repo.orders_inserted == 0
     assert fake_repo.status_updates[-1] == ("intent-3", "rejected")
+
+
+def test_run_executor_once_rejects_by_data_quality_staleness(monkeypatch):
+    fake_repo = _FakeRepo(
+        "postgresql://unused",
+        intents=[
+            {
+                "intent_id": "intent-4",
+                "portfolio_id": "portfolio-4",
+                "strategy_version_id": "sv-3",
+                "target_positions": [{"symbol": "JP:4444", "target_qty": 10}],
+                "risk_checks": {"drawdown": -0.005, "sharpe_20d": 0.3},
+                "broker_map": {"JP": "kabu"},
+                "portfolio_name": "core",
+            }
+        ],
+        latest_price={"close_raw": 111.0, "trade_date": date(2020, 1, 1)},
+    )
+
+    monkeypatch.setattr(
+        executor_job,
+        "load_yaml_config",
+        lambda: {
+            "execution": {
+                "risk_gate": {"max_drawdown_breach": -0.03, "min_sharpe_20d": 0.0},
+                "data_quality": {
+                    "enabled": True,
+                    "reject_on_missing_price": True,
+                    "max_price_staleness_days": {"JP": 1, "US": 1, "CRYPTO": 1},
+                },
+            }
+        },
+    )
+    monkeypatch.setattr(executor_job, "load_runtime_secrets", lambda: SimpleNamespace(database_url="postgresql://unused"))
+    monkeypatch.setattr(executor_job, "NeonRepository", lambda dsn: fake_repo)
+
+    stats = executor_job.run_executor_once(limit=10)
+
+    assert stats["processed"] == 1
+    assert stats["rejected"] == 1
+    assert stats["skipped_by_data_quality"] == 1
+    assert fake_repo.orders_inserted == 0
+    assert fake_repo.status_updates[-1] == ("intent-4", "rejected")

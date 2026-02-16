@@ -184,6 +184,14 @@ data_sources:
     - edinet_api
   us_disclosure: sec_edgar
 
+data_quality:
+  weekly:
+    enabled: true
+    lookback_days: 14
+    min_coverage_ratio:
+      JP: 0.90
+      US: 0.90
+
 strategy_factory:
   enabled: true
   max_parallel_tasks: 5
@@ -209,6 +217,13 @@ strategy_factory:
     screening_block_status: draft
 
 execution:
+  data_quality:
+    enabled: true
+    reject_on_missing_price: true
+    max_price_staleness_days:
+      JP: 7
+      US: 7
+      CRYPTO: 2
   risk_gate:
     max_drawdown_breach: -0.03
     min_sharpe_20d: 0.0
