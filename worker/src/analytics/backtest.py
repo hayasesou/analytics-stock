@@ -96,7 +96,13 @@ def _build_equity_curve(
     benchmark_curve: pd.DataFrame,
 ) -> pd.DataFrame:
     if not trades:
-        return pd.DataFrame(columns=["trade_date", "equity", "benchmark_equity"])
+        if benchmark_curve.empty:
+            return pd.DataFrame(columns=["trade_date", "equity", "benchmark_equity"])
+        curve = benchmark_curve.copy()
+        curve["trade_date"] = pd.to_datetime(curve["trade_date"]).dt.date
+        curve = curve.sort_values("trade_date").reset_index(drop=True)
+        curve["equity"] = 1.0
+        return curve[["trade_date", "equity", "benchmark_equity"]]
 
     start = min(t.entry_date for t in trades)
     end = max(t.exit_date for t in trades)
@@ -219,7 +225,9 @@ def run_backtest(
     config: dict[str, Any],
 ) -> list[BacktestResult]:
     if prices.empty or signals.empty:
-        return []
+        if prices.empty:
+            return []
+        signals = pd.DataFrame(columns=["security_id", "market", "as_of_date", "is_signal", "entry_allowed"])
 
     prices = prices.copy()
     prices["trade_date"] = pd.to_datetime(prices["trade_date"]).dt.date
@@ -227,8 +235,6 @@ def run_backtest(
 
     signals = signals.copy()
     signals = signals[(signals["is_signal"]) & (signals["entry_allowed"])].reset_index(drop=True)
-    if signals.empty:
-        return []
 
     atr_cfg = config["risk_management"]["atr"]
     stop_multiple = float(atr_cfg["initial_stop_multiple"])

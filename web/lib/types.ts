@@ -83,6 +83,47 @@ export type BacktestPoint = {
   benchmarkEquity: number | null;
 };
 
+export type BacktestReasonCode =
+  | "ok"
+  | "no_signals"
+  | "no_weekly_run"
+  | "requested_run_not_found"
+  | "requested_run_has_no_backtest"
+  | "latest_weekly_has_no_backtest"
+  | "no_backtest_run"
+  | "no_metrics"
+  | "no_curve";
+
+export type BacktestRunOption = {
+  runId: string;
+  status: string;
+  startedAt: string;
+  finishedAt: string | null;
+  signals: number | null;
+  backtestProfiles: number | null;
+  hasBacktestRun: boolean;
+};
+
+export type BacktestMeta = {
+  requestedRunId: string | null;
+  resolvedRunId: string | null;
+  latestWeeklyRunId: string | null;
+  latestWithBacktestRunId: string | null;
+  resolvedSource: "requested" | "latest_weekly" | "latest_with_backtest" | "none";
+  reasonCode: BacktestReasonCode;
+  resolvedRunStatus: string | null;
+  resolvedRunStartedAt: string | null;
+  resolvedRunFinishedAt: string | null;
+  resolvedRunSignals: number | null;
+  resolvedRunBacktestProfiles: number | null;
+};
+
+export type BacktestData = {
+  metrics: BacktestMetric[];
+  curve: BacktestPoint[];
+  meta: BacktestMeta;
+};
+
 export type SecurityTimelinePrice = {
   date: string;
   close: number;
@@ -194,10 +235,50 @@ export type ResearchStrategy = {
   updatedAt: string;
   versionId: string | null;
   version: number | null;
+  evalRunId: string | null;
   evalType: "quick_backtest" | "robust_backtest" | "paper" | "live" | null;
   sharpe: number | null;
   maxDd: number | null;
   cagr: number | null;
+  validationPassed: boolean | null;
+  validationFoldCount: number | null;
+  validationPrimaryProfile: string | null;
+  foldSharpeFirst: number | null;
+  foldSharpeLast: number | null;
+  foldSharpeDelta: number | null;
+  foldSharpeMin: number | null;
+  foldSharpeMax: number | null;
+  validationFailReasons: string[];
+  validationFolds: ResearchValidationFold[];
+  validationGates: ResearchValidationGates | null;
+};
+
+export type ResearchValidationGates = {
+  minFoldCount: number | null;
+  minTradesPerFold: number | null;
+  minSharpe: number | null;
+  minCagr: number | null;
+  minMaxDd: number | null;
+};
+
+export type ResearchValidationFoldProfile = {
+  sharpe: number | null;
+  cagr: number | null;
+  maxDd: number | null;
+  tradeCount: number | null;
+};
+
+export type ResearchValidationFold = {
+  fold: number;
+  trainStart: string;
+  trainEnd: string;
+  testStart: string;
+  testEnd: string;
+  signalCount: number;
+  momentumThreshold: number | null;
+  skipped: boolean;
+  skipReason: string | null;
+  profiles: Record<string, ResearchValidationFoldProfile>;
 };
 
 export type ResearchFundamentalSnapshot = {
