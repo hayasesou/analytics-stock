@@ -12,6 +12,7 @@ class _FakeRepo:
     def __init__(self, _dsn: str):
         self.fundamentals = 0
         self.tasks = 0
+        self.documents = 0
         self.finished: tuple[str, dict] | None = None
         self.strategy_statuses: list[str] = []
 
@@ -53,6 +54,12 @@ class _FakeRepo:
     def upsert_fundamental_snapshot(self, snapshot, security_uuid_map=None):  # noqa: ANN001, ARG002
         assert snapshot.rating in {"A", "B", "C"}
         self.fundamentals += 1
+
+    def upsert_document_with_version(self, **kwargs):  # noqa: ANN003
+        assert kwargs["source_system"] == "deep_research"
+        assert kwargs["mime_type"] == "text/plain"
+        self.documents += 1
+        return "doc-version-1"
 
     def enqueue_agent_task(self, task_type: str, payload: dict, priority: int = 100):
         assert payload["strategy_name"].startswith("sf-")
@@ -183,3 +190,70 @@ def test_run_research_blocks_candidate_when_rating_c(monkeypatch):
     research_job.run_research(limit=1)
 
     assert fake_repo.strategy_statuses == ["draft"]
+
+
+def test_run_research_imports_deep_research_and_stores_document(monkeypatch):
+    fake_repo = _FakeRepo("postgresql://unused")
+    deep_input = SimpleNamespace(
+        security_id="JP:1111",
+        report_text="深い調査レポート本文",
+        source="deep_research",
+        report_path="/tmp/deep_research.txt",
+    )
+
+    class _FakeR2:
+        def __init__(self, **kwargs):  # noqa: ANN003
+            _ = kwargs
+
+        def available(self) -> bool:
+            return False
+
+        def put_text(self, key: str, text: str, evidence: bool = False):  # noqa: ANN001
+            _ = (key, text, evidence)
+
+    monkeypatch.setattr(
+        research_job,
+        "load_yaml_config",
+        lambda: {"version": "1.1", "strategy_factory": {"max_parallel_tasks": 5, "candidate_limit": 20}},
+    )
+    monkeypatch.setattr(
+        research_job,
+        "load_runtime_secrets",
+        lambda: SimpleNamespace(database_url="postgresql://unused", openai_api_key=None),
+    )
+    monkeypatch.setattr(research_job, "NeonRepository", lambda dsn: fake_repo)
+    monkeypatch.setattr(research_job, "R2Storage", lambda **kwargs: _FakeR2(**kwargs))
+    monkeypatch.setattr(research_job, "parse_deep_research_file_if_configured", lambda: deep_input)
+    monkeypatch.setattr(
+        research_job,
+        "build_deep_research_snapshot",
+        lambda payload, api_key, model: {  # noqa: ARG005
+            "source": payload.source,
+            "rating": "A",
+            "summary": "ok",
+            "snapshot": {"drivers": ["d1"], "catalysts": ["c1"], "risks": ["r1"]},
+        },
+    )
+    monkeypatch.setattr(
+        research_job,
+        "run_walk_forward_validation",
+        lambda **kwargs: {  # noqa: ARG005
+            "gate": {"passed": True, "primary_cost_profile": "strict", "reasons": []},
+            "summary": {
+                "strict": {
+                    "fold_count": 3,
+                    "total_trades": 10,
+                    "mean_sharpe": 0.5,
+                    "median_sharpe": 0.4,
+                    "worst_max_dd": -0.15,
+                    "mean_cagr": 0.08,
+                }
+            },
+            "folds": [],
+        },
+    )
+
+    research_job.run_research(limit=1)
+
+    assert fake_repo.documents == 1
+    assert fake_repo.fundamentals == 2

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+import hashlib
 import traceback
 from typing import Any
 
@@ -12,6 +13,7 @@ from src.research import (
     parse_deep_research_file_if_configured,
 )
 from src.storage.db import NeonRepository
+from src.storage.r2 import R2Storage
 from src.types import FundamentalSnapshot, StrategyEvaluation, StrategySpec, StrategyVersionSpec
 
 DEFAULT_AGENT_TASK_TYPES = [
@@ -117,6 +119,13 @@ def run_research(limit: int | None = None) -> str:
     cfg = load_yaml_config()
     secrets = load_runtime_secrets()
     repo = NeonRepository(secrets.database_url)
+    r2 = R2Storage(
+        endpoint_url=getattr(secrets, "r2_endpoint", None),
+        access_key_id=getattr(secrets, "r2_access_key_id", None),
+        secret_access_key=getattr(secrets, "r2_secret_access_key", None),
+        bucket_evidence=getattr(secrets, "r2_bucket_evidence", None),
+        bucket_data=getattr(secrets, "r2_bucket_data", None),
+    )
 
     run_id = repo.create_run(
         "research",
@@ -262,11 +271,53 @@ def run_research(limit: int | None = None) -> str:
         deep_input = parse_deep_research_file_if_configured()
         deep_saved = 0
         if deep_input:
+            retrieved_at = datetime.now()
+            report_sha = hashlib.sha256(deep_input.report_text.encode("utf-8")).hexdigest()
+            security_slug = deep_input.security_id.replace(":", "_").replace("/", "_")
+            report_key = f"research/deep_research/{today.isoformat()}/{security_slug}/{report_sha}.txt"
+            stored_in_r2 = r2.available()
+            if stored_in_r2:
+                r2.put_text(report_key, deep_input.report_text, evidence=True)
+
+            report_source_url = (
+                f"file://{deep_input.report_path}"
+                if getattr(deep_input, "report_path", None)
+                else f"deep_research://{deep_input.security_id}/{today.isoformat()}"
+            )
+
+            doc_version_id = repo.upsert_document_with_version(
+                external_doc_id=f"{deep_input.security_id}:{report_sha}",
+                source_system=str(getattr(deep_input, "source", "deep_research")),
+                source_url=report_source_url,
+                title=f"Deep Research {deep_input.security_id} {today.isoformat()}",
+                published_at=retrieved_at,
+                retrieved_at=retrieved_at,
+                sha256=report_sha,
+                mime_type="text/plain",
+                r2_object_key=report_key,
+                r2_text_key=report_key,
+                page_count=1,
+            )
+
             deep_snapshot = build_deep_research_snapshot(
                 deep_input,
                 api_key=secrets.openai_api_key,
                 model=(sf_cfg.get("escalation", {}) or {}).get("heavy_model"),
             )
+            deep_snapshot_payload = dict(deep_snapshot["snapshot"])
+            deep_snapshot_payload.update(
+                {
+                    "doc_version_id": doc_version_id,
+                    "r2_text_key": report_key,
+                    "sha256": report_sha,
+                }
+            )
+            if stored_in_r2:
+                deep_snapshot_payload["raw_report_storage"] = "r2_evidence"
+            else:
+                # Fallback for local/dev environments without R2.
+                deep_snapshot_payload["raw_report_storage"] = "fundamental_snapshot_inline"
+                deep_snapshot_payload["raw_report_text"] = deep_input.report_text
             # Keep import idempotent by using today's snapshot with dedicated source.
             try:
                 repo.upsert_fundamental_snapshot(
@@ -277,7 +328,7 @@ def run_research(limit: int | None = None) -> str:
                         rating=str(deep_snapshot["rating"]),
                         confidence="High",
                         summary=str(deep_snapshot["summary"]),
-                        snapshot=dict(deep_snapshot["snapshot"]),
+                        snapshot=deep_snapshot_payload,
                         created_by="deep-research-import",
                     ),
                 )
