@@ -1196,6 +1196,12 @@ export async function fetchBacktestData(input?: {
     where backtest_run_id = ${resolvedBacktestRunId}::uuid
     order by trade_date asc
   `;
+  const tradeCountRows = await sql<{ trade_count: number }[]>`
+    select count(*)::int as trade_count
+    from backtest_trades
+    where backtest_run_id = ${resolvedBacktestRunId}::uuid
+  `;
+  const tradeCount = Number(tradeCountRows[0]?.trade_count ?? 0);
 
   const rawCurve = curveRows.map((r) => ({
     costProfile: r.cost_profile,
@@ -1221,7 +1227,7 @@ export async function fetchBacktestData(input?: {
     reasonCode = "no_metrics";
   } else if (curve.length === 0) {
     reasonCode = "no_curve";
-  } else if ((targetRun.signals ?? -1) === 0) {
+  } else if (tradeCount === 0) {
     reasonCode = "no_signals";
   }
 
