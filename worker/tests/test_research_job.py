@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 from types import SimpleNamespace
 
+import pandas as pd
+
 from src.jobs import research as research_job
 
 
@@ -10,6 +12,7 @@ class _FakeRepo:
     def __init__(self, _dsn: str):
         self.fundamentals = 0
         self.tasks = 0
+        self.documents = 0
         self.finished: tuple[str, dict] | None = None
         self.strategy_statuses: list[str] = []
 
@@ -44,13 +47,19 @@ class _FakeRepo:
         return "strategy-version-1"
 
     def insert_strategy_evaluation(self, evaluation):  # noqa: ANN001
-        assert evaluation.eval_type == "quick_backtest"
+        assert evaluation.eval_type == "robust_backtest"
         assert isinstance(evaluation.period_start, date)
         return "eval-1"
 
     def upsert_fundamental_snapshot(self, snapshot, security_uuid_map=None):  # noqa: ANN001, ARG002
         assert snapshot.rating in {"A", "B", "C"}
         self.fundamentals += 1
+
+    def upsert_document_with_version(self, **kwargs):  # noqa: ANN003
+        assert kwargs["source_system"] == "deep_research"
+        assert kwargs["mime_type"] == "text/plain"
+        self.documents += 1
+        return "doc-version-1"
 
     def enqueue_agent_task(self, task_type: str, payload: dict, priority: int = 100):
         assert payload["strategy_name"].startswith("sf-")
@@ -59,6 +68,22 @@ class _FakeRepo:
 
     def finish_run(self, run_id: str, status: str, metadata=None):  # noqa: ANN001
         self.finished = (status, metadata or {})
+
+    def fetch_price_history_for_security(self, security_id: str, start_date: date, end_date: date):  # noqa: ANN001
+        _ = (security_id, start_date, end_date)
+        return pd.DataFrame(
+            [
+                {
+                    "security_id": "JP:1111",
+                    "market": "JP",
+                    "trade_date": date(2025, 1, 10),
+                    "open_raw": 100.0,
+                    "high_raw": 101.0,
+                    "low_raw": 99.0,
+                    "close_raw": 100.5,
+                }
+            ]
+        )
 
 
 def test_run_research_creates_candidates_and_tasks(monkeypatch):
@@ -71,6 +96,24 @@ def test_run_research_creates_candidates_and_tasks(monkeypatch):
     monkeypatch.setattr(research_job, "load_runtime_secrets", lambda: SimpleNamespace(database_url="postgresql://unused", openai_api_key=None))
     monkeypatch.setattr(research_job, "NeonRepository", lambda dsn: fake_repo)
     monkeypatch.setattr(research_job, "parse_deep_research_file_if_configured", lambda: None)
+    monkeypatch.setattr(
+        research_job,
+        "run_walk_forward_validation",
+        lambda **kwargs: {  # noqa: ARG005
+            "gate": {"passed": True, "primary_cost_profile": "strict", "reasons": []},
+            "summary": {
+                "strict": {
+                    "fold_count": 3,
+                    "total_trades": 10,
+                    "mean_sharpe": 0.5,
+                    "median_sharpe": 0.4,
+                    "worst_max_dd": -0.15,
+                    "mean_cagr": 0.08,
+                }
+            },
+            "folds": [],
+        },
+    )
 
     run_id = research_job.run_research(limit=1)
 
@@ -125,7 +168,92 @@ def test_run_research_blocks_candidate_when_rating_c(monkeypatch):
     )
     monkeypatch.setattr(research_job, "NeonRepository", lambda dsn: fake_repo)
     monkeypatch.setattr(research_job, "parse_deep_research_file_if_configured", lambda: None)
+    monkeypatch.setattr(
+        research_job,
+        "run_walk_forward_validation",
+        lambda **kwargs: {  # noqa: ARG005
+            "gate": {"passed": False, "primary_cost_profile": "strict", "reasons": ["median_sharpe<0.3"]},
+            "summary": {
+                "strict": {
+                    "fold_count": 1,
+                    "total_trades": 1,
+                    "mean_sharpe": -0.1,
+                    "median_sharpe": -0.1,
+                    "worst_max_dd": -0.5,
+                    "mean_cagr": -0.02,
+                }
+            },
+            "folds": [],
+        },
+    )
 
     research_job.run_research(limit=1)
 
     assert fake_repo.strategy_statuses == ["draft"]
+
+
+def test_run_research_imports_deep_research_and_stores_document(monkeypatch):
+    fake_repo = _FakeRepo("postgresql://unused")
+    deep_input = SimpleNamespace(
+        security_id="JP:1111",
+        report_text="深い調査レポート本文",
+        source="deep_research",
+        report_path="/tmp/deep_research.txt",
+    )
+
+    class _FakeR2:
+        def __init__(self, **kwargs):  # noqa: ANN003
+            _ = kwargs
+
+        def available(self) -> bool:
+            return False
+
+        def put_text(self, key: str, text: str, evidence: bool = False):  # noqa: ANN001
+            _ = (key, text, evidence)
+
+    monkeypatch.setattr(
+        research_job,
+        "load_yaml_config",
+        lambda: {"version": "1.1", "strategy_factory": {"max_parallel_tasks": 5, "candidate_limit": 20}},
+    )
+    monkeypatch.setattr(
+        research_job,
+        "load_runtime_secrets",
+        lambda: SimpleNamespace(database_url="postgresql://unused", openai_api_key=None),
+    )
+    monkeypatch.setattr(research_job, "NeonRepository", lambda dsn: fake_repo)
+    monkeypatch.setattr(research_job, "R2Storage", lambda **kwargs: _FakeR2(**kwargs))
+    monkeypatch.setattr(research_job, "parse_deep_research_file_if_configured", lambda: deep_input)
+    monkeypatch.setattr(
+        research_job,
+        "build_deep_research_snapshot",
+        lambda payload, api_key, model: {  # noqa: ARG005
+            "source": payload.source,
+            "rating": "A",
+            "summary": "ok",
+            "snapshot": {"drivers": ["d1"], "catalysts": ["c1"], "risks": ["r1"]},
+        },
+    )
+    monkeypatch.setattr(
+        research_job,
+        "run_walk_forward_validation",
+        lambda **kwargs: {  # noqa: ARG005
+            "gate": {"passed": True, "primary_cost_profile": "strict", "reasons": []},
+            "summary": {
+                "strict": {
+                    "fold_count": 3,
+                    "total_trades": 10,
+                    "mean_sharpe": 0.5,
+                    "median_sharpe": 0.4,
+                    "worst_max_dd": -0.15,
+                    "mean_cagr": 0.08,
+                }
+            },
+            "folds": [],
+        },
+    )
+
+    research_job.run_research(limit=1)
+
+    assert fake_repo.documents == 1
+    assert fake_repo.fundamentals == 2

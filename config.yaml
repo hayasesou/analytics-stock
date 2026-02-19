@@ -196,6 +196,28 @@ strategy_factory:
   enabled: true
   max_parallel_tasks: 5
   candidate_limit: 20
+  validation:
+    enabled: true
+    lookback_days: 900
+    train_days: 252
+    test_days: 63
+    step_days: 63
+    warmup_days: 40
+    execution_buffer_days: 70
+    momentum_quantile: 0.65
+    max_volatility_20d: 0.80
+    min_signal_gap_days: 5
+    min_signals_per_fold: 2
+    primary_cost_profile: strict
+    strict_cost_profile: strict
+    gates:
+      min_fold_count: 3
+      min_total_trades: 8
+      min_median_sharpe: 0.30
+      min_mean_sharpe: 0.20
+      min_worst_max_dd: -0.25
+      min_strict_median_sharpe: 0.10
+      require_positive_mean_cagr: false
   escalation:
     lightweight_model: gpt-5-mini
     heavy_model: gpt-5-pro

@@ -131,6 +131,7 @@ docker compose --profile jobs run --rm worker-research
 
 - `worker-research`:
   - 最新 weekly 候補から戦略候補 (`strategies`, `strategy_versions`, `strategy_evaluations`) を生成
+  - `strategy_factory.validation` の固定ルールで Walk-forward 検証を実行し、`robust_backtest` として保存
   - A/B/C ファンダ判断 (`fundamental_snapshots`) を作成
   - 5つの自律エージェントタスク (`agent_tasks`) を起票
 - `agents`:
@@ -139,6 +140,17 @@ docker compose --profile jobs run --rm worker-research
   - 承認済み `order_intents` のみ実行
   - DD 3% / rolling SR(20d) のリスクゲート
   - A/B/C を使った最終発注ゲート（C除外、B縮小、A通常）
+
+### 戦略検証ゲート（固定ルール + 動的評価）
+
+- ルールは `config.yaml` の `strategy_factory.validation` で固定:
+  - `train_days / test_days / step_days`
+  - `momentum_quantile / max_volatility_20d`
+  - `gates`（Sharpe・DD・取引数など）
+- 評価は動的:
+  - 最新価格履歴を使った Walk-forward を `worker-research` 実行時に再計算
+  - `strategy_evaluations.eval_type = robust_backtest` に保存
+- 候補戦略は「ファンダ判定 + 検証ゲート」の両方を通過したもののみ `candidate` 扱いになります。
 
 ### LLM テスト
 

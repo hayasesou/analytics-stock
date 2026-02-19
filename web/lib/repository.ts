@@ -2,8 +2,12 @@ import { randomUUID } from "node:crypto";
 
 import { getSql } from "@/lib/db";
 import type {
+  BacktestData,
+  BacktestMeta,
   BacktestMetric,
   BacktestPoint,
+  BacktestReasonCode,
+  BacktestRunOption,
   CitationRecord,
   ExecutionOrderIntent,
   ExecutionRiskSnapshot,
@@ -37,6 +41,10 @@ function decodeSecurityId(raw: string): string {
   }
 }
 
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 function clampLookbackDays(days: number): number {
   if (!Number.isFinite(days)) {
     return 180;
@@ -56,6 +64,13 @@ function clampExecutionLimit(limit: number): number {
     return 50;
   }
   return Math.min(200, Math.max(1, Math.trunc(limit)));
+}
+
+function clampBacktestRunLimit(limit: number): number {
+  if (!Number.isFinite(limit)) {
+    return 20;
+  }
+  return Math.min(200, Math.max(20, Math.trunc(limit)));
 }
 
 function mapSecurityIdentityRow(row: {
@@ -78,6 +93,154 @@ function isLegacyMockSecurity(row: { market: "JP" | "US"; name: string }): boole
     return /^JP Corp \d{4}$/.test(name);
   }
   return /^US Holdings \d+$/.test(name);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function asNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
+function asBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function extractFoldValidationSummary(
+  metricsValue: unknown,
+  artifactsValue: unknown
+): Pick<
+  ResearchStrategy,
+  | "validationPassed"
+  | "validationFoldCount"
+  | "validationPrimaryProfile"
+  | "foldSharpeFirst"
+  | "foldSharpeLast"
+  | "foldSharpeDelta"
+  | "foldSharpeMin"
+  | "foldSharpeMax"
+  | "validationFailReasons"
+  | "validationFolds"
+  | "validationGates"
+> {
+  const metrics = asRecord(metricsValue);
+  const artifacts = asRecord(artifactsValue);
+  const validation = asRecord(artifacts?.validation);
+  const gate = asRecord(validation?.gate);
+  const summary = asRecord(validation?.summary);
+  const policy = asRecord(validation?.policy);
+  const gates = asRecord(policy?.gates);
+
+  const primaryProfile =
+    asString(metrics?.validation_primary_profile)
+    ?? asString(gate?.primary_cost_profile)
+    ?? "standard";
+
+  const primarySummary = summary ? asRecord(summary[primaryProfile]) : null;
+  const profileFoldCount = asNumber(primarySummary?.fold_count);
+  const foldCountFromMetrics = asNumber(metrics?.validation_fold_count);
+
+  const foldsRaw = Array.isArray(validation?.folds) ? validation.folds : [];
+  const normalizedFolds: ResearchStrategy["validationFolds"] = [];
+  const sharpeSeries: number[] = [];
+
+  for (const foldRaw of foldsRaw) {
+    const fold = asRecord(foldRaw);
+    if (!fold) {
+      continue;
+    }
+    const profiles = asRecord(fold.profiles);
+    const normalizedProfiles: Record<string, { sharpe: number | null; cagr: number | null; maxDd: number | null; tradeCount: number | null }> = {};
+    if (profiles) {
+      for (const [profileName, rawProfileMetrics] of Object.entries(profiles)) {
+        const profileMetrics = asRecord(rawProfileMetrics);
+        if (!profileMetrics) {
+          continue;
+        }
+        normalizedProfiles[profileName] = {
+          sharpe: asNumber(profileMetrics.sharpe),
+          cagr: asNumber(profileMetrics.cagr),
+          maxDd: asNumber(profileMetrics.max_dd),
+          tradeCount: asNumber(profileMetrics.trade_count)
+        };
+      }
+    }
+
+    const skipped = asBoolean(fold.skipped) ?? false;
+    const primarySharpe = normalizedProfiles[primaryProfile]?.sharpe ?? null;
+    if (!skipped && primarySharpe != null) {
+      sharpeSeries.push(primarySharpe);
+    }
+
+    normalizedFolds.push({
+      fold: asNumber(fold.fold) ?? normalizedFolds.length,
+      trainStart: asString(fold.train_start) ?? "",
+      trainEnd: asString(fold.train_end) ?? "",
+      testStart: asString(fold.test_start) ?? "",
+      testEnd: asString(fold.test_end) ?? "",
+      signalCount: asNumber(fold.signal_count) ?? 0,
+      momentumThreshold: asNumber(fold.momentum_threshold),
+      skipped,
+      skipReason: asString(fold.skip_reason),
+      profiles: normalizedProfiles
+    });
+  }
+
+  const foldSharpeFirst = sharpeSeries.length > 0 ? sharpeSeries[0] : null;
+  const foldSharpeLast = sharpeSeries.length > 0 ? sharpeSeries[sharpeSeries.length - 1] : null;
+  const foldSharpeMin = sharpeSeries.length > 0 ? Math.min(...sharpeSeries) : null;
+  const foldSharpeMax = sharpeSeries.length > 0 ? Math.max(...sharpeSeries) : null;
+  const foldSharpeDelta = (foldSharpeFirst != null && foldSharpeLast != null)
+    ? foldSharpeLast - foldSharpeFirst
+    : null;
+
+  const failReasons = asStringArray(metrics?.validation_fail_reasons);
+  const gateReasons = asStringArray(gate?.reasons);
+  const validationGates = gates
+    ? {
+        minFoldCount: asNumber(gates.min_fold_count),
+        minTradesPerFold: asNumber(gates.min_trades_per_fold),
+        minSharpe: asNumber(gates.min_sharpe),
+        minCagr: asNumber(gates.min_cagr),
+        minMaxDd: asNumber(gates.min_max_dd)
+      }
+    : null;
+
+  return {
+    validationPassed: asBoolean(metrics?.validation_passed) ?? asBoolean(gate?.passed),
+    validationFoldCount: foldCountFromMetrics ?? profileFoldCount ?? (sharpeSeries.length || null),
+    validationPrimaryProfile: primaryProfile,
+    foldSharpeFirst,
+    foldSharpeLast,
+    foldSharpeDelta,
+    foldSharpeMin,
+    foldSharpeMax,
+    validationFailReasons: failReasons.length > 0 ? failReasons : gateReasons,
+    validationFolds: normalizedFolds,
+    validationGates
+  };
 }
 
 export async function latestRunId(runType: "weekly" | "daily"): Promise<string | null> {
@@ -827,25 +990,161 @@ export async function fetchLatestDailyEvents(limit = 10): Promise<EventRecord[]>
   }));
 }
 
-export async function fetchBacktestData(): Promise<{
-  metrics: BacktestMetric[];
-  curve: BacktestPoint[];
-}> {
+export async function fetchBacktestData(input?: {
+  runId?: string | null;
+  fallbackMode?: "none" | "latest_with_backtest";
+}): Promise<BacktestData> {
   const sql = getSql();
-  const runId = await latestRunId("weekly");
-  if (!runId) {
-    return { metrics: [], curve: [] };
+  const requestedRunIdRaw = input?.runId?.trim() || null;
+  const requestedRunId = requestedRunIdRaw && isUuid(requestedRunIdRaw) ? requestedRunIdRaw : null;
+  const fallbackMode = input?.fallbackMode === "latest_with_backtest" ? "latest_with_backtest" : "none";
+
+  type RunMetaRow = {
+    run_id: string;
+    status: string;
+    started_at: string;
+    finished_at: string | null;
+    signals: number | null;
+    backtest_profiles: number | null;
+  };
+  type LatestWithBacktestRow = RunMetaRow & {
+    backtest_run_id: string;
+  };
+
+  const latestWeeklyRunId = await latestRunId("weekly");
+  const latestWithBacktestRows = await sql<LatestWithBacktestRow[]>`
+    select
+      r.id::text as run_id,
+      br.id::text as backtest_run_id,
+      r.status,
+      r.started_at::text as started_at,
+      r.finished_at::text as finished_at,
+      nullif(r.metadata->>'signals', '')::int as signals,
+      nullif(r.metadata->>'backtest_profiles', '')::int as backtest_profiles
+    from backtest_runs br
+    join runs r on r.id = br.run_id
+    where r.run_type = 'weekly'
+      and r.status = 'success'
+    order by coalesce(r.finished_at, r.started_at) desc, br.created_at desc
+    limit 1
+  `;
+  const latestWithBacktest = latestWithBacktestRows[0] ?? null;
+  const latestWithBacktestRunId = latestWithBacktest?.run_id ?? null;
+
+  const buildMeta = (
+    partial?: Partial<BacktestMeta>
+  ): BacktestMeta => ({
+    requestedRunId: requestedRunIdRaw,
+    resolvedRunId: null,
+    latestWeeklyRunId,
+    latestWithBacktestRunId,
+    resolvedSource: "none",
+    reasonCode: "no_weekly_run",
+    resolvedRunStatus: null,
+    resolvedRunStartedAt: null,
+    resolvedRunFinishedAt: null,
+    resolvedRunSignals: null,
+    resolvedRunBacktestProfiles: null,
+    ...partial
+  });
+
+  const emptyResponse = (meta: BacktestMeta): BacktestData => ({
+    metrics: [],
+    curve: [],
+    meta
+  });
+
+  const runMetaById = async (runId: string): Promise<RunMetaRow | null> => {
+    const rows = await sql<RunMetaRow[]>`
+      select
+        r.id::text as run_id,
+        r.status,
+        r.started_at::text as started_at,
+        r.finished_at::text as finished_at,
+        nullif(r.metadata->>'signals', '')::int as signals,
+        nullif(r.metadata->>'backtest_profiles', '')::int as backtest_profiles
+      from runs r
+      where r.id = ${runId}::uuid
+        and r.run_type = 'weekly'
+      limit 1
+    `;
+    return rows[0] ?? null;
+  };
+
+  const latestWeeklyMeta = latestWeeklyRunId ? await runMetaById(latestWeeklyRunId) : null;
+  if (!latestWeeklyMeta && !requestedRunId) {
+    return emptyResponse(buildMeta({ reasonCode: "no_weekly_run" }));
   }
 
-  const backtest = await sql<{ id: string }[]>`
+  let targetRun: RunMetaRow | null = null;
+  let resolvedSource: BacktestMeta["resolvedSource"] = "none";
+  let fallbackReason: BacktestReasonCode | null = null;
+
+  if (requestedRunIdRaw && !requestedRunId) {
+    if (fallbackMode === "latest_with_backtest" && latestWithBacktest) {
+      targetRun = latestWithBacktest;
+      resolvedSource = "latest_with_backtest";
+      fallbackReason = "requested_run_not_found";
+    } else {
+      return emptyResponse(buildMeta({ reasonCode: "requested_run_not_found" }));
+    }
+  } else if (requestedRunId) {
+    const requestedMeta = await runMetaById(requestedRunId);
+    if (!requestedMeta) {
+      if (fallbackMode === "latest_with_backtest" && latestWithBacktest) {
+        targetRun = latestWithBacktest;
+        resolvedSource = "latest_with_backtest";
+        fallbackReason = "requested_run_not_found";
+      } else {
+        return emptyResponse(buildMeta({ reasonCode: "requested_run_not_found" }));
+      }
+    } else {
+      targetRun = requestedMeta;
+      resolvedSource = "requested";
+    }
+  } else {
+    targetRun = latestWeeklyMeta;
+    resolvedSource = "latest_weekly";
+  }
+
+  if (!targetRun) {
+    return emptyResponse(buildMeta({ reasonCode: "no_weekly_run" }));
+  }
+
+  const backtestRows = await sql<{ id: string }[]>`
     select id::text as id
     from backtest_runs
-    where run_id = ${runId}::uuid
+    where run_id = ${targetRun.run_id}::uuid
     order by created_at desc
     limit 1
   `;
-  if (!backtest[0]) {
-    return { metrics: [], curve: [] };
+  let resolvedBacktestRunId = backtestRows[0]?.id ?? null;
+  if (!resolvedBacktestRunId && fallbackMode === "latest_with_backtest" && latestWithBacktest) {
+    const latestHasDifferentRun = latestWithBacktest.run_id !== targetRun.run_id;
+    if (latestHasDifferentRun) {
+      fallbackReason = requestedRunId ? "requested_run_has_no_backtest" : "latest_weekly_has_no_backtest";
+      targetRun = latestWithBacktest;
+      resolvedSource = "latest_with_backtest";
+      resolvedBacktestRunId = latestWithBacktest.backtest_run_id;
+    }
+  }
+
+  if (!resolvedBacktestRunId) {
+    const reason: BacktestReasonCode = requestedRunId
+      ? "requested_run_has_no_backtest"
+      : "latest_weekly_has_no_backtest";
+    return emptyResponse(
+      buildMeta({
+        resolvedRunId: targetRun.run_id,
+        resolvedSource,
+        reasonCode: reason,
+        resolvedRunStatus: targetRun.status,
+        resolvedRunStartedAt: targetRun.started_at,
+        resolvedRunFinishedAt: targetRun.finished_at,
+        resolvedRunSignals: targetRun.signals,
+        resolvedRunBacktestProfiles: targetRun.backtest_profiles
+      })
+    );
   }
 
   const metricsRows = await sql<
@@ -876,7 +1175,7 @@ export async function fetchBacktestData(): Promise<{
       alpha_simple,
       information_ratio_simple
     from backtest_metrics
-    where backtest_run_id = ${backtest[0].id}::uuid and market_scope = 'MIXED'
+    where backtest_run_id = ${resolvedBacktestRunId}::uuid and market_scope = 'MIXED'
     order by cost_profile asc
   `;
 
@@ -894,9 +1193,15 @@ export async function fetchBacktestData(): Promise<{
       equity,
       benchmark_equity
     from backtest_equity_curve
-    where backtest_run_id = ${backtest[0].id}::uuid
+    where backtest_run_id = ${resolvedBacktestRunId}::uuid
     order by trade_date asc
   `;
+  const tradeCountRows = await sql<{ trade_count: number }[]>`
+    select count(*)::int as trade_count
+    from backtest_trades
+    where backtest_run_id = ${resolvedBacktestRunId}::uuid
+  `;
+  const tradeCount = Number(tradeCountRows[0]?.trade_count ?? 0);
 
   const rawCurve = curveRows.map((r) => ({
     costProfile: r.cost_profile,
@@ -917,6 +1222,15 @@ export async function fetchBacktestData(): Promise<{
     };
   });
 
+  let reasonCode: BacktestReasonCode = fallbackReason ?? "ok";
+  if (metricsRows.length === 0) {
+    reasonCode = "no_metrics";
+  } else if (curve.length === 0) {
+    reasonCode = "no_curve";
+  } else if (tradeCount === 0) {
+    reasonCode = "no_signals";
+  }
+
   return {
     metrics: metricsRows.map((r) => ({
       costProfile: r.cost_profile,
@@ -931,8 +1245,66 @@ export async function fetchBacktestData(): Promise<{
       alphaSimple: Number(r.alpha_simple ?? 0),
       informationRatioSimple: Number(r.information_ratio_simple ?? 0)
     })),
-    curve
+    curve,
+    meta: buildMeta({
+      resolvedRunId: targetRun.run_id,
+      resolvedSource,
+      reasonCode,
+      resolvedRunStatus: targetRun.status,
+      resolvedRunStartedAt: targetRun.started_at,
+      resolvedRunFinishedAt: targetRun.finished_at,
+      resolvedRunSignals: targetRun.signals,
+      resolvedRunBacktestProfiles: targetRun.backtest_profiles
+    })
   };
+}
+
+export async function fetchBacktestRunOptions(input?: {
+  limit?: number | null;
+}): Promise<BacktestRunOption[]> {
+  const sql = getSql();
+  const limit = clampBacktestRunLimit(input?.limit ?? 20);
+  const rows = await sql<
+    {
+      run_id: string;
+      status: string;
+      started_at: string;
+      finished_at: string | null;
+      signals: number | null;
+      backtest_profiles: number | null;
+      has_backtest_run: boolean;
+    }[]
+  >`
+    select
+      r.id::text as run_id,
+      r.status,
+      r.started_at::text as started_at,
+      r.finished_at::text as finished_at,
+      nullif(r.metadata->>'signals', '')::int as signals,
+      nullif(r.metadata->>'backtest_profiles', '')::int as backtest_profiles,
+      (br.id is not null) as has_backtest_run
+    from runs r
+    left join lateral (
+      select id
+      from backtest_runs
+      where run_id = r.id
+      order by created_at desc
+      limit 1
+    ) br on true
+    where r.run_type = 'weekly'
+    order by coalesce(r.finished_at, r.started_at) desc
+    limit ${limit}
+  `;
+
+  return rows.map((r) => ({
+    runId: r.run_id,
+    status: r.status,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at,
+    signals: r.signals == null ? null : Number(r.signals),
+    backtestProfiles: r.backtest_profiles == null ? null : Number(r.backtest_profiles),
+    hasBacktestRun: Boolean(r.has_backtest_run)
+  }));
 }
 
 export async function fetchExecutionOrderIntents(input?: {
@@ -1097,6 +1469,9 @@ export async function fetchResearchStrategies(input?: {
         sharpe: number | null;
         max_dd: number | null;
         cagr: number | null;
+        eval_run_id: string | null;
+        eval_metrics: Record<string, unknown> | null;
+        eval_artifacts: Record<string, unknown> | null;
       }[]
     >`
       with latest_versions as (
@@ -1113,7 +1488,10 @@ export async function fetchResearchStrategies(input?: {
           se.eval_type,
           nullif(se.metrics->>'sharpe', '')::double precision as sharpe,
           nullif(se.metrics->>'max_dd', '')::double precision as max_dd,
-          nullif(se.metrics->>'cagr', '')::double precision as cagr
+          nullif(se.metrics->>'cagr', '')::double precision as cagr,
+          nullif(se.artifacts->>'run_id', '')::text as eval_run_id,
+          se.metrics as eval_metrics,
+          se.artifacts as eval_artifacts
         from strategy_evaluations se
         order by se.strategy_version_id, se.created_at desc
       )
@@ -1128,7 +1506,10 @@ export async function fetchResearchStrategies(input?: {
         le.eval_type,
         le.sharpe,
         le.max_dd,
-        le.cagr
+        le.cagr,
+        le.eval_run_id,
+        le.eval_metrics,
+        le.eval_artifacts
       from strategies s
       left join latest_versions lv on lv.strategy_id = s.id
       left join latest_eval le on le.strategy_version_id = lv.version_id::uuid
@@ -1138,6 +1519,7 @@ export async function fetchResearchStrategies(input?: {
     `;
 
     return rows.map((r) => ({
+      ...extractFoldValidationSummary(r.eval_metrics, r.eval_artifacts),
       strategyId: r.strategy_id,
       strategyName: r.strategy_name,
       assetScope: r.asset_scope,
@@ -1145,6 +1527,7 @@ export async function fetchResearchStrategies(input?: {
       updatedAt: r.updated_at,
       versionId: r.version_id,
       version: r.version,
+      evalRunId: r.eval_run_id,
       evalType: r.eval_type,
       sharpe: r.sharpe == null ? null : Number(r.sharpe),
       maxDd: r.max_dd == null ? null : Number(r.max_dd),

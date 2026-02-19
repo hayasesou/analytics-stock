@@ -141,6 +141,53 @@ def test_upsert_prices_uses_copy_and_upsert() -> None:
     assert "INSERT INTO prices_daily" in executed_sql
 
 
+def test_upsert_document_with_version_inserts_document_and_version() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchone_value = {"id": "11111111-1111-1111-1111-111111111111"}
+    repo = _repo_with_fake_conn(fake_conn)
+
+    doc_version_id = repo.upsert_document_with_version(
+        external_doc_id="JP:1111:abc",
+        source_system="deep_research",
+        source_url="file:///tmp/deep-report.txt",
+        title="Deep Research JP:1111",
+        published_at=datetime(2026, 2, 18, 9, 0, 0),
+        retrieved_at=datetime(2026, 2, 18, 9, 1, 0),
+        sha256="a" * 64,
+        mime_type="text/plain",
+        r2_object_key="research/deep_research/2026-02-18/JP_1111/aaa.txt",
+        r2_text_key="research/deep_research/2026-02-18/JP_1111/aaa.txt",
+        page_count=1,
+    )
+
+    assert doc_version_id == "11111111-1111-1111-1111-111111111111"
+    assert fake_conn.commit_count == 1
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "INSERT INTO documents" in executed_sql
+    assert "INSERT INTO document_versions" in executed_sql
+
+
+def test_upsert_document_with_version_rejects_invalid_sha() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    try:
+        repo.upsert_document_with_version(
+            external_doc_id="JP:1111:bad",
+            source_system="deep_research",
+            source_url="file:///tmp/deep-report.txt",
+            title="x",
+            published_at=None,
+            retrieved_at=None,
+            sha256="12345",
+            mime_type="text/plain",
+            r2_object_key="k",
+        )
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
 def test_upsert_prices_rolls_back_when_no_mapped_rows() -> None:
     fake_conn = _FakeConnection()
     repo = _repo_with_fake_conn(fake_conn)
