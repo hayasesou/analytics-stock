@@ -5,9 +5,11 @@ import Link from "next/link";
 import {
   fetchResearchAgentTasks,
   fetchResearchFundamentalSnapshots,
+  fetchResearchKanban,
   fetchResearchStrategies
 } from "@/lib/repository";
 import { ResearchFoldValidationPanel } from "@/components/ResearchFoldValidationPanel";
+import { StrategyLifecycleActions } from "@/components/StrategyLifecycleActions";
 import { TermHelp } from "@/components/TermHelp";
 
 const TERM_HELP = {
@@ -129,6 +131,22 @@ function ratingClass(rating: string): "high" | "medium" | "low" {
   return "low";
 }
 
+function fmtBool(v: boolean | null): string {
+  if (v == null) {
+    return "-";
+  }
+  return v ? "OK" : "NG";
+}
+
+const KANBAN_LABELS = {
+  new: "new",
+  analyzing: "analyzing",
+  rejected: "rejected",
+  candidate: "candidate",
+  paper: "paper",
+  live: "live"
+} as const;
+
 export default async function ResearchPage({
   searchParams
 }: {
@@ -159,16 +177,51 @@ export default async function ResearchPage({
     | "canceled"
     | "";
 
-  const [strategies, fundamentals, agentTasks] = await Promise.all([
+  const [strategies, fundamentals, agentTasks, kanbanLanes] = await Promise.all([
     fetchResearchStrategies({ status: strategyStatus || null, limit }),
     fetchResearchFundamentalSnapshots({ rating: rating || null, limit }),
-    fetchResearchAgentTasks({ status: taskStatus || null, limit })
+    fetchResearchAgentTasks({ status: taskStatus || null, limit }),
+    fetchResearchKanban({ limitPerLane: 3 })
   ]);
+  const kanbanTotal = kanbanLanes.reduce((acc, lane) => acc + lane.count, 0);
 
   return (
     <div className="grid" style={{ gap: 12 }}>
       <div className="card">
         <h1>研究管理（LV4 Strategy Factory）</h1>
+        <div className="hint-line" style={{ marginTop: 6 }}>
+          <Link className="action-link" href={"/edge" as any}>
+            Edge監視へ
+          </Link>
+          <span>|</span>
+          <Link className="action-link" href={"/research/chat" as any}>
+            Research Chatへ
+          </Link>
+          <span>|</span>
+          <Link className="action-link" href={"/research/sessions" as any}>
+            Sessionsへ
+          </Link>
+          <span>|</span>
+          <Link className="action-link" href={"/research/inputs" as any}>
+            Inputsへ
+          </Link>
+          <span>|</span>
+          <Link className="action-link" href={"/research/hypotheses" as any}>
+            Hypothesesへ
+          </Link>
+          <span>|</span>
+          <Link className="action-link" href={"/research/artifacts" as any}>
+            Artifactsへ
+          </Link>
+          <span>|</span>
+          <Link className="action-link" href={"/research/validation" as any}>
+            Validationへ
+          </Link>
+          <span>|</span>
+          <Link className="action-link" href="/execution">
+            執行監視へ
+          </Link>
+        </div>
         <form className="grid three" style={{ alignItems: "end", marginTop: 10 }}>
           <div className="grid" style={{ gap: 6 }}>
             <label htmlFor="strategyStatus">Strategy Status</label>
@@ -214,6 +267,50 @@ export default async function ResearchPage({
       </div>
 
       <div className="card">
+        <h2>Research Kanban</h2>
+        <div className="grid three">
+          <div className="metric">
+            <span className="k">Total</span>
+            <span className="v">{kanbanTotal}</span>
+          </div>
+          {kanbanLanes.map((lane) => (
+            <div className="metric" key={`kanban-metric-${lane.lane}`}>
+              <span className="k">{KANBAN_LABELS[lane.lane]}</span>
+              <span className="v">{lane.count}</span>
+            </div>
+          ))}
+        </div>
+        <div className="table-wrap" style={{ marginTop: 10 }}>
+          <table>
+            <thead>
+              <tr>
+                <th>Lane</th>
+                <th>Count</th>
+                <th>Samples</th>
+              </tr>
+            </thead>
+            <tbody>
+              {kanbanLanes.map((lane) => (
+                <tr key={`kanban-row-${lane.lane}`}>
+                  <td>{KANBAN_LABELS[lane.lane]}</td>
+                  <td>{lane.count}</td>
+                  <td>
+                    {lane.items.length === 0
+                      ? "-"
+                      : lane.items
+                          .map((item) =>
+                            item.subtitle ? `${item.title} (${item.subtitle})` : item.title
+                          )
+                          .join(" / ")}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="card">
         <h2>戦略一覧</h2>
         <div className="table-wrap">
           <table>
@@ -222,6 +319,7 @@ export default async function ResearchPage({
                 <th>Name</th>
                 <th>Scope</th>
                 <th>Status</th>
+                <th>LiveCandidate</th>
                 <th>Version</th>
                 <th>
                   <span className="term-head">
@@ -279,12 +377,15 @@ export default async function ResearchPage({
                   </span>
                 </th>
                 <th>Backtest</th>
+                <th>Paper Progress</th>
+                <th>Lifecycle</th>
+                <th>Action</th>
               </tr>
             </thead>
             <tbody>
               {strategies.length === 0 ? (
                 <tr>
-                  <td colSpan={15}>戦略データがありません。</td>
+                  <td colSpan={19}>戦略データがありません。</td>
                 </tr>
               ) : (
                 strategies.map((s) => (
@@ -292,6 +393,7 @@ export default async function ResearchPage({
                     <td className="mono">{s.strategyName}</td>
                     <td>{s.assetScope}</td>
                     <td>{s.status}</td>
+                    <td>{s.liveCandidate ? "yes" : "no"}</td>
                     <td>{s.version ?? "-"}</td>
                     <td>{s.evalType ?? "-"}</td>
                     <td
@@ -327,6 +429,33 @@ export default async function ResearchPage({
                       ) : (
                         "-"
                       )}
+                    </td>
+                    <td>
+                      {s.paperDays == null && s.paperRoundTrips == null
+                        ? "-"
+                        : `${s.paperDays ?? 0}d / ${s.paperRoundTrips ?? 0}rt (${fmtBool(
+                            s.paperGateDaysOk
+                          )}/${fmtBool(s.paperGateRoundTripsOk)}/${fmtBool(s.paperGateRiskOk)})`}
+                    </td>
+                    <td
+                      title={
+                        s.lastLifecycleReason
+                          ? `${s.lastLifecycleAction ?? "-"}: ${s.lastLifecycleReason}`
+                          : undefined
+                      }
+                    >
+                      {s.lastLifecycleAction
+                        ? `${s.lastLifecycleAction} by ${s.lastLifecycleBy ?? "-"}`
+                        : "-"}
+                      {s.lastLifecycleAt ? ` @ ${formatJst(s.lastLifecycleAt)} JST` : ""}
+                      {s.lastLifecycleRecheckAfter ? ` / recheck ${s.lastLifecycleRecheckAfter}` : ""}
+                    </td>
+                    <td>
+                      <StrategyLifecycleActions
+                        strategyId={s.strategyId}
+                        status={s.status}
+                        liveCandidate={s.liveCandidate}
+                      />
                     </td>
                   </tr>
                 ))

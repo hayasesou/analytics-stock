@@ -175,6 +175,25 @@ notifications:
       - weekly_summary_link
       - backtest_link
 
+discord_ingest:
+  enabled: true
+  inbox_channel_name: inbox
+  max_urls_per_message: 3
+  reply_in_thread: true
+  allow_bot_messages: false
+  message_dedupe_cache_size: 5000
+  url_dedupe_window_sec: 300
+  allowed_guild_ids: []
+
+discord_research:
+  enabled: true
+  auto_thread: true
+  max_urls_per_message: 5
+
+research_chat:
+  poll_interval_sec: 5
+  batch_size: 20
+
 data_sources:
   jp_prices: jquants_light
   us_prices: massive_stocks_starter
@@ -230,6 +249,20 @@ strategy_factory:
   candidate_gate:
     require_robust_backtest: true
     require_manual_approval_to_live: true
+  lifecycle:
+    enabled: true
+    evaluation_lookback_days: 365
+    auto_promote_candidate_to_paper: true
+    live_candidate_gate:
+      max_drawdown_breach: -0.03
+      min_sharpe_20d: 0.0
+    paper_requirements:
+      crypto:
+        min_days: 14
+        min_round_trips: 50
+      equities:
+        min_days: 60
+        min_round_trips: 10
   fundamental_overlay:
     enabled: true
     screening_allow_ratings:
@@ -238,7 +271,222 @@ strategy_factory:
     screening_pass_status: candidate
     screening_block_status: draft
 
+agents:
+  adapter:
+    mode: builtin
+    openclaw_poc:
+      enabled: false
+      strategy_design_only: true
+      max_retries: 2
+      retry_backoff_sec: 0.05
+      simulated_latency_ms: 120
+      simulated_jitter_ms: 30
+      simulated_failure_rate: 0.10
+      deterministic: true
+      cost_usd_per_task: 0.07
+      fallback_to_builtin_on_error: true
+      command: ""
+      timeout_sec: 8
+  evaluation:
+    samples: 20
+    attempts_per_sample: 3
+    output_path: docs/openclaw-evaluation.md
+    go_no_go:
+      max_failure_rate: 0.10
+      min_reproducibility: 0.85
+      max_latency_ratio_vs_builtin: 2.0
+      max_cost_ratio_vs_builtin: 1.5
+
+edge_radar:
+  enabled: true
+  notify:
+    top_n: 10
+  equities:
+    run_hour_jst: 20
+    run_minute_jst: 10
+    max_candidates: 50
+    entry_threshold_bps: 2.0
+    expected_cost_bps:
+      JP_EQ: 8.0
+      US_EQ: 10.0
+  crypto:
+    run_minute_jst: 5
+    max_candidates: 20
+    entry_threshold_bps: 1.5
+    expected_cost_bps: 12.0
+    strategy_defaults:
+      perp_perp:
+        ewma_alpha: 0.2
+        z_entry: 2.0
+        z_exit: 0.6
+        z_signal_scale_bps: 2.5
+        entry_min_edge_bps: 0.8
+        fee_bps: 4.0
+        slippage_bps: 3.0
+        borrow_bps: 0.0
+        min_liquidity_score: 0.35
+        min_liquidation_distance_pct: 0.15
+        epsilon_notional_usd: 10.0
+        target_notional_usd: 1000.0
+        timeout_sec: 30
+        score_per_bps: 3.0
+      cash_carry:
+        ewma_alpha: 0.2
+        z_entry: 1.8
+        z_exit: 0.5
+        z_signal_scale_bps: 2.0
+        basis_entry_bps: 8.0
+        basis_exit_bps: 3.0
+        entry_min_edge_bps: 0.8
+        fee_bps: 4.0
+        slippage_bps: 3.0
+        borrow_bps: 0.0
+        min_liquidity_score: 0.35
+        min_liquidation_distance_pct: 0.15
+        epsilon_notional_usd: 10.0
+        target_notional_usd: 1000.0
+        timeout_sec: 30
+        score_per_bps: 3.0
+    intent_generation:
+      enabled: true
+      status: proposed
+      portfolio_name: crypto_arb
+      base_currency: USD
+      max_new_intents_per_run: 5
+      lookback_minutes: 180
+      min_edge_score: 55.0
+      min_confidence: 0.55
+      require_positive_expected_edge: true
+      broker_map:
+        CRYPTO: crypto_gateway
+  formula:
+    combined_weight: 0.55
+    legacy_edge_weight: 0.45
+    signal_scale_bps: 0.30
+    confidence_multiplier:
+      High: 1.0
+      Medium: 0.75
+      Low: 0.5
+    source_boost_bps_per_primary: 0.8
+    max_source_boost_bps: 4.0
+    contradiction_penalty_bps: 5.0
+    missing_penalty_bps_per_10pct: 1.0
+    score_per_bps: 3.0
+    crypto_sharpe_bps_factor: 10.0
+    crypto_cagr_bps_factor: 80.0
+    crypto_drawdown_penalty_bps_factor: 25.0
+    crypto_status_bonus_bps:
+      candidate: 0.0
+      approved: 0.5
+      paper: 1.0
+      live: 2.0
+
+crypto_marketdata:
+  enabled: true
+  run_minute_jst: 3
+  quality_window_sec: 60
+  pairs:
+    - symbol: BTC
+      binance_symbol: BTCUSDT
+      hyperliquid_symbol: BTC
+      collect_spot: true
+      collect_perp: true
+      binance_enabled: true
+      hyperliquid_enabled: true
+    - symbol: ETH
+      binance_symbol: ETHUSDT
+      hyperliquid_symbol: ETH
+      collect_spot: true
+      collect_perp: true
+      binance_enabled: true
+      hyperliquid_enabled: true
+    - symbol: SOL
+      binance_symbol: SOLUSDT
+      hyperliquid_symbol: SOL
+      collect_spot: true
+      collect_perp: true
+      binance_enabled: true
+      hyperliquid_enabled: true
+    - symbol: HYPE
+      binance_symbol: HYPEUSDT
+      hyperliquid_symbol: HYPE
+      collect_spot: false
+      collect_perp: true
+      binance_enabled: false
+      hyperliquid_enabled: true
+    - symbol: BNB
+      binance_symbol: BNBUSDT
+      hyperliquid_symbol: BNB
+      collect_spot: true
+      collect_perp: true
+      binance_enabled: true
+      hyperliquid_enabled: false
+    - symbol: USDC
+      binance_symbol: USDCUSDT
+      hyperliquid_symbol: USDC
+      collect_spot: true
+      collect_perp: false
+      binance_enabled: true
+      hyperliquid_enabled: false
+  binance:
+    enabled: true
+    rest_timeout_sec: 5.0
+    ws_timeout_sec: 1.5
+  hyperliquid:
+    enabled: true
+    rest_timeout_sec: 5.0
+    ws_timeout_sec: 1.5
+  data_quality:
+    max_missing_ratio: 0.25
+    max_latency_ms: 3000
+    lookback_minutes: 60
+
+youtube_ingest:
+  enabled: true
+  request_timeout_sec: 8
+  retry_count: 2
+  max_comments: 20000
+  max_comment_pages: 200
+  max_comment_duration_sec: 600
+  max_claims: 5
+  min_claim_chars: 20
+  idea_priority: 80
+  task_priority: 30
+  created_by: discord-user
+
 execution:
+  order_reconcile:
+    enabled: true
+    min_abs_delta_qty: 0.0
+    min_abs_delta_notional: 0.0
+    open_order_policy: skip
+    net_notional_epsilon: 10.0
+    neutrality_strategy_types:
+      - perp_perp
+      - cash_carry
+      - pair
+      - stat_arb
+  gateway_jp:
+    enabled: true
+    broker_name: gateway_jp
+    base_url: http://gateway-jp:8081
+    auth_token_env: JP_GATEWAY_AUTH_TOKEN
+    request_timeout_sec: 8
+    wait_timeout_sec: 2
+  gateway_us:
+    enabled: true
+    broker_name: gateway_us
+    base_url: http://gateway-us:8090
+    auth_token_env: US_GATEWAY_AUTH_TOKEN
+    request_timeout_sec: 8
+    default_order_timeout_sec: 20
+  gateway_crypto:
+    enabled: true
+    broker_name: crypto_gateway
+    base_url: http://gateway-crypto:8080
+    auth_token_env: CRYPTO_GATEWAY_AUTH_TOKEN
+    request_timeout_sec: 8
+    default_leg_timeout_sec: 30
   data_quality:
     enabled: true
     reject_on_missing_price: true
@@ -250,6 +498,16 @@ execution:
     max_drawdown_breach: -0.03
     min_sharpe_20d: 0.0
     rolling_sharpe_window_days: 20
+  strategy_risk_gate:
+    enabled: true
+    max_drawdown_breach: -0.03
+    warning_sharpe_threshold: 0.3
+    warning_consecutive_days: 3
+    halt_sharpe_threshold: 0.0
+    halt_consecutive_days: 2
+    cooldown_hours: 24
+    panic_close_on_halt: true
+    symbol_lookback_days: 30
   fundamental_overlay:
     enabled: true
     allow_if_missing: true

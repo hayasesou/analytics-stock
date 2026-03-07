@@ -1,5 +1,7 @@
 export const dynamic = "force-dynamic";
 
+import Link from "next/link";
+
 import { ExecutionDashboard } from "@/components/ExecutionDashboard";
 import { fetchExecutionOrderIntents, fetchExecutionRiskSnapshots } from "@/lib/repository";
 
@@ -75,6 +77,15 @@ export default async function ExecutionPage({
       <div className="card">
         <h1>執行監視（Intent / Risk）</h1>
         <p className="mono">order_intents, orders, fills, positions, risk_snapshots を監視</p>
+        <div className="hint-line" style={{ marginTop: 6 }}>
+          <Link className="action-link" href={"/edge" as any}>
+            Edge監視へ
+          </Link>
+          <span>|</span>
+          <Link className="action-link" href="/research">
+            研究管理へ
+          </Link>
+        </div>
         <form className="grid three" style={{ alignItems: "end", marginTop: 10 }}>
           <div className="grid" style={{ gap: 6 }}>
             <label htmlFor="status">Intent Status</label>

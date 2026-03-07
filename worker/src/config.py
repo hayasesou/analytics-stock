@@ -12,6 +12,7 @@ import yaml
 class RuntimeSecrets:
     database_url: str
     discord_webhook_url: str | None
+    discord_bot_token: str | None
     openai_api_key: str | None
     r2_account_id: str | None
     r2_access_key_id: str | None
@@ -59,6 +60,7 @@ def load_runtime_secrets() -> RuntimeSecrets:
     return RuntimeSecrets(
         database_url=database_url,
         discord_webhook_url=_env("DISCORD_WEBHOOK_URL"),
+        discord_bot_token=_env("DISCORD_BOT_TOKEN"),
         openai_api_key=_env("OPENAI_API_KEY"),
         r2_account_id=_env("R2_ACCOUNT_ID"),
         r2_access_key_id=_env("R2_ACCESS_KEY_ID"),

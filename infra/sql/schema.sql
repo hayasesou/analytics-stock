@@ -70,6 +70,59 @@ CREATE TABLE IF NOT EXISTS fx_rates_daily (
   PRIMARY KEY (pair, trade_date)
 );
 
+CREATE TABLE IF NOT EXISTS crypto_market_snapshots (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  exchange TEXT NOT NULL CHECK (exchange IN ('binance', 'hyperliquid')),
+  symbol TEXT NOT NULL,
+  market_type TEXT NOT NULL CHECK (market_type IN ('spot', 'perp')),
+  observed_at TIMESTAMPTZ NOT NULL,
+  best_bid NUMERIC(24, 10),
+  best_ask NUMERIC(24, 10),
+  mid NUMERIC(24, 10),
+  spread_bps NUMERIC(18, 8),
+  funding_rate NUMERIC(18, 10),
+  open_interest NUMERIC(24, 10),
+  mark_price NUMERIC(24, 10),
+  index_price NUMERIC(24, 10),
+  basis_bps NUMERIC(18, 8),
+  source_mode TEXT NOT NULL CHECK (source_mode IN ('ws', 'rest')),
+  latency_ms NUMERIC(12, 3),
+  data_quality JSONB NOT NULL DEFAULT '{}'::jsonb,
+  raw_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (exchange, symbol, market_type, observed_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_crypto_market_snapshots_symbol_time
+  ON crypto_market_snapshots (symbol, market_type, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_crypto_market_snapshots_exchange_time
+  ON crypto_market_snapshots (exchange, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS crypto_data_quality (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  exchange TEXT NOT NULL CHECK (exchange IN ('binance', 'hyperliquid')),
+  symbol TEXT NOT NULL,
+  market_type TEXT NOT NULL CHECK (market_type IN ('spot', 'perp')),
+  window_start TIMESTAMPTZ NOT NULL,
+  window_end TIMESTAMPTZ NOT NULL,
+  sample_count INTEGER NOT NULL DEFAULT 0 CHECK (sample_count >= 0),
+  missing_count INTEGER NOT NULL DEFAULT 0 CHECK (missing_count >= 0),
+  missing_ratio NUMERIC(10, 6) NOT NULL DEFAULT 0,
+  latency_p95_ms NUMERIC(12, 3),
+  ws_failover_count INTEGER NOT NULL DEFAULT 0 CHECK (ws_failover_count >= 0),
+  eligible_for_edge BOOLEAN NOT NULL DEFAULT TRUE,
+  details JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (exchange, symbol, market_type, window_start, window_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_crypto_data_quality_symbol_window
+  ON crypto_data_quality (exchange, symbol, market_type, window_end DESC);
+
+CREATE INDEX IF NOT EXISTS idx_crypto_data_quality_edge_gate
+  ON crypto_data_quality (eligible_for_edge, window_end DESC);
+
 CREATE TABLE IF NOT EXISTS documents (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   external_doc_id TEXT NOT NULL,
@@ -328,17 +381,123 @@ CREATE TABLE IF NOT EXISTS chat_message_citations (
 
 CREATE INDEX IF NOT EXISTS idx_chat_message_citations_msg ON chat_message_citations (message_id);
 
+CREATE TABLE IF NOT EXISTS external_inputs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id UUID NOT NULL REFERENCES chat_sessions(id),
+  message_id UUID REFERENCES chat_messages(id),
+  source_type TEXT NOT NULL CHECK (source_type IN ('discord', 'web', 'x', 'youtube', 'web_url', 'text')),
+  source_url TEXT,
+  raw_text TEXT,
+  extracted_text TEXT,
+  quality_grade TEXT CHECK (quality_grade IN ('A', 'B', 'C')),
+  extraction_status TEXT NOT NULL DEFAULT 'queued' CHECK (extraction_status IN ('queued', 'success', 'partial', 'failed')),
+  user_comment TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_inputs_session_time ON external_inputs (session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_external_inputs_source_type ON external_inputs (source_type, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_hypotheses (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id UUID NOT NULL REFERENCES chat_sessions(id),
+  external_input_id UUID REFERENCES external_inputs(id),
+  parent_message_id UUID REFERENCES chat_messages(id),
+  stance TEXT NOT NULL CHECK (stance IN ('bullish', 'bearish', 'neutral', 'watch')),
+  horizon_days INTEGER NOT NULL CHECK (horizon_days IN (1, 5, 20, 60, 120)),
+  thesis_md TEXT NOT NULL,
+  falsification_md TEXT NOT NULL,
+  confidence NUMERIC(4, 3),
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'watch', 'validate', 'passed', 'failed', 'archived')),
+  is_favorite BOOLEAN NOT NULL DEFAULT FALSE,
+  version INTEGER NOT NULL DEFAULT 1,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_hypotheses_session_time ON research_hypotheses (session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_research_hypotheses_status ON research_hypotheses (status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_hypothesis_assets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  hypothesis_id UUID NOT NULL REFERENCES research_hypotheses(id) ON DELETE CASCADE,
+  asset_class TEXT NOT NULL CHECK (asset_class IN ('JP_EQ', 'US_EQ', 'CRYPTO')),
+  security_id UUID REFERENCES securities(id),
+  symbol_text TEXT,
+  weight_hint NUMERIC(6, 4),
+  confidence NUMERIC(4, 3),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_hypothesis_assets_hypothesis ON research_hypothesis_assets (hypothesis_id);
+
+CREATE TABLE IF NOT EXISTS research_hypothesis_outcomes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  hypothesis_id UUID NOT NULL REFERENCES research_hypotheses(id) ON DELETE CASCADE,
+  checked_at TIMESTAMPTZ NOT NULL,
+  ret_1d NUMERIC(10, 4),
+  ret_5d NUMERIC(10, 4),
+  ret_20d NUMERIC(10, 4),
+  mfe NUMERIC(10, 4),
+  mae NUMERIC(10, 4),
+  outcome_label TEXT NOT NULL CHECK (outcome_label IN ('hit', 'miss', 'partial', 'open')),
+  summary_md TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_hypothesis_outcomes_hypothesis_time
+  ON research_hypothesis_outcomes (hypothesis_id, checked_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_artifacts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id UUID NOT NULL REFERENCES chat_sessions(id),
+  hypothesis_id UUID REFERENCES research_hypotheses(id) ON DELETE SET NULL,
+  artifact_type TEXT NOT NULL CHECK (artifact_type IN ('sql', 'python', 'chart', 'table', 'note', 'report')),
+  title TEXT NOT NULL,
+  body_md TEXT,
+  code_text TEXT,
+  language TEXT,
+  is_favorite BOOLEAN NOT NULL DEFAULT FALSE,
+  created_by_task_id UUID,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_artifacts_session_time ON research_artifacts (session_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_artifact_runs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  artifact_id UUID NOT NULL REFERENCES research_artifacts(id) ON DELETE CASCADE,
+  run_status TEXT NOT NULL CHECK (run_status IN ('pending', 'running', 'success', 'failed')),
+  stdout_text TEXT,
+  stderr_text TEXT,
+  result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  output_r2_key TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_artifact_runs_artifact_time
+  ON research_artifact_runs (artifact_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS strategies (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL UNIQUE,
   description TEXT,
   asset_scope TEXT NOT NULL CHECK (asset_scope IN ('JP_EQ', 'US_EQ', 'CRYPTO', 'MIXED')),
   status TEXT NOT NULL CHECK (status IN ('draft', 'candidate', 'approved', 'paper', 'live', 'paused', 'retired')),
+  live_candidate BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE strategies
+  ADD COLUMN IF NOT EXISTS live_candidate BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies (status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_strategies_live_candidate
+  ON strategies (live_candidate, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS strategy_versions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -358,6 +517,36 @@ CREATE TABLE IF NOT EXISTS strategy_versions (
 CREATE INDEX IF NOT EXISTS idx_strategy_versions_active
   ON strategy_versions (strategy_id, is_active, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS strategy_lifecycle_reviews (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  strategy_id UUID NOT NULL REFERENCES strategies(id) ON DELETE CASCADE,
+  strategy_version_id UUID REFERENCES strategy_versions(id) ON DELETE SET NULL,
+  action TEXT NOT NULL CHECK (action IN (
+    'promote_paper',
+    'mark_live_candidate',
+    'approve_live',
+    'reject_live',
+    'demote_live_candidate',
+    'manual_status_update'
+  )),
+  from_status TEXT NOT NULL,
+  to_status TEXT NOT NULL,
+  live_candidate BOOLEAN NOT NULL DEFAULT FALSE,
+  reason TEXT,
+  recheck_condition TEXT,
+  recheck_after DATE,
+  acted_by TEXT NOT NULL,
+  acted_at TIMESTAMPTZ NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_lifecycle_reviews_strategy_time
+  ON strategy_lifecycle_reviews (strategy_id, acted_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_lifecycle_reviews_action_time
+  ON strategy_lifecycle_reviews (action, acted_at DESC);
+
 CREATE TABLE IF NOT EXISTS strategy_evaluations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   strategy_version_id UUID NOT NULL REFERENCES strategy_versions(id) ON DELETE CASCADE,
@@ -371,6 +560,171 @@ CREATE TABLE IF NOT EXISTS strategy_evaluations (
 
 CREATE INDEX IF NOT EXISTS idx_strategy_evaluations_type_time
   ON strategy_evaluations (eval_type, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS edge_states (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  strategy_name TEXT NOT NULL,
+  strategy_version_id UUID REFERENCES strategy_versions(id) ON DELETE SET NULL,
+  market_scope TEXT NOT NULL CHECK (market_scope IN ('JP_EQ', 'US_EQ', 'CRYPTO', 'MIXED')),
+  symbol TEXT NOT NULL,
+  observed_at TIMESTAMPTZ NOT NULL,
+  edge_score NUMERIC(8, 4) NOT NULL,
+  expected_net_edge NUMERIC(12, 6),
+  distance_to_entry NUMERIC(12, 6),
+  expected_net_edge_bps NUMERIC(12, 6),
+  distance_to_entry_bps NUMERIC(12, 6),
+  confidence NUMERIC(8, 4),
+  risk_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  risk JSONB NOT NULL DEFAULT '{}'::jsonb,
+  explain TEXT,
+  market_regime TEXT,
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (strategy_name, market_scope, symbol, observed_at)
+);
+
+ALTER TABLE edge_states
+  ADD COLUMN IF NOT EXISTS expected_net_edge NUMERIC(12, 6);
+
+ALTER TABLE edge_states
+  ADD COLUMN IF NOT EXISTS distance_to_entry NUMERIC(12, 6);
+
+ALTER TABLE edge_states
+  ADD COLUMN IF NOT EXISTS risk_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE edge_states
+  ADD COLUMN IF NOT EXISTS market_regime TEXT;
+
+UPDATE edge_states
+SET expected_net_edge = COALESCE(expected_net_edge, expected_net_edge_bps),
+    distance_to_entry = COALESCE(distance_to_entry, distance_to_entry_bps),
+    risk_json = CASE
+        WHEN risk_json = '{}'::jsonb AND COALESCE(risk, '{}'::jsonb) <> '{}'::jsonb THEN risk
+        ELSE risk_json
+    END,
+    market_regime = COALESCE(market_regime, market_scope)
+WHERE (expected_net_edge IS NULL AND expected_net_edge_bps IS NOT NULL)
+   OR (distance_to_entry IS NULL AND distance_to_entry_bps IS NOT NULL)
+   OR market_regime IS NULL
+   OR (risk_json = '{}'::jsonb AND COALESCE(risk, '{}'::jsonb) <> '{}'::jsonb);
+
+CREATE INDEX IF NOT EXISTS idx_edge_states_scope_time
+  ON edge_states (market_scope, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_edge_states_strategy_time
+  ON edge_states (strategy_name, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_edge_states_strategy_version_time
+  ON edge_states (strategy_version_id, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_edge_states_observed_at
+  ON edge_states (observed_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_edge_states_strategy_version_symbol_observed
+  ON edge_states (strategy_version_id, symbol, observed_at)
+  WHERE strategy_version_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ideas (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  source_type TEXT NOT NULL,
+  source_url TEXT,
+  title TEXT NOT NULL,
+  raw_text TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'new',
+  priority INTEGER NOT NULL DEFAULT 100 CHECK (priority >= 0 AND priority <= 1000),
+  created_by TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ideas_status_priority_created
+  ON ideas (status, priority, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ideas_source_url
+  ON ideas (source_type, source_url)
+  WHERE source_url IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS idea_evidence (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  idea_id UUID NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+  doc_version_id UUID NOT NULL REFERENCES document_versions(id) ON DELETE RESTRICT,
+  excerpt TEXT NOT NULL,
+  locator JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_idea_evidence_idea_time
+  ON idea_evidence (idea_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_idea_evidence_doc
+  ON idea_evidence (doc_version_id);
+
+CREATE TABLE IF NOT EXISTS experiments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  idea_id UUID NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+  strategy_version_id UUID REFERENCES strategy_versions(id) ON DELETE SET NULL,
+  hypothesis TEXT NOT NULL,
+  eval_status TEXT NOT NULL DEFAULT 'queued',
+  metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+  artifacts JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiments_idea_status_time
+  ON experiments (idea_id, eval_status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_experiments_strategy_time
+  ON experiments (strategy_version_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS lessons (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  idea_id UUID NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+  experiment_id UUID REFERENCES experiments(id) ON DELETE SET NULL,
+  lesson_type TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  reusable_checklist JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_lessons_idea_time
+  ON lessons (idea_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_lessons_experiment
+  ON lessons (experiment_id);
+
+CREATE TABLE IF NOT EXISTS strategy_risk_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  strategy_version_id UUID NOT NULL REFERENCES strategy_versions(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  triggered_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_risk_events_strategy_time
+  ON strategy_risk_events (strategy_version_id, triggered_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_risk_events_type_time
+  ON strategy_risk_events (event_type, triggered_at DESC);
+
+CREATE TABLE IF NOT EXISTS strategy_risk_snapshots (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  strategy_version_id UUID NOT NULL REFERENCES strategy_versions(id) ON DELETE CASCADE,
+  as_of TIMESTAMPTZ NOT NULL,
+  as_of_date DATE NOT NULL,
+  drawdown NUMERIC(10, 6),
+  sharpe_20d NUMERIC(10, 6),
+  state TEXT NOT NULL CHECK (state IN ('normal', 'warning', 'halted', 'cooldown')),
+  trigger_flags JSONB NOT NULL DEFAULT '{}'::jsonb,
+  cooldown_until TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (strategy_version_id, as_of_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_risk_snapshots_strategy_time
+  ON strategy_risk_snapshots (strategy_version_id, as_of DESC);
 
 CREATE TABLE IF NOT EXISTS portfolios (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -482,6 +836,42 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_queue ON agent_tasks (status, priority, created_at);
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS session_id UUID REFERENCES chat_sessions(id);
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS parent_task_id UUID REFERENCES agent_tasks(id);
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS lease_owner TEXT;
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 3;
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS error_text TEXT;
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS assigned_role TEXT;
+
+ALTER TABLE agent_tasks
+  ADD COLUMN IF NOT EXISTS assigned_node TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_session ON agent_tasks (session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_lease ON agent_tasks (status, available_at, lease_expires_at);
 
 CREATE TABLE IF NOT EXISTS fundamental_snapshots (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

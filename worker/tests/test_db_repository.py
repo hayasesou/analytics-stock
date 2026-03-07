@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import date, datetime
+import json
 from typing import Any
 
 import pandas as pd
@@ -9,10 +10,21 @@ import pandas as pd
 from src.storage.db import NeonRepository
 from src.types import (
     CitationItem,
+    CryptoDataQualitySnapshot,
+    CryptoMarketSnapshot,
+    EdgeRisk,
+    EdgeState,
+    ExperimentSpec,
     FundamentalSnapshot,
+    IdeaEvidenceSpec,
+    IdeaSpec,
+    LessonSpec,
     OrderIntent,
     PortfolioSpec,
     ReportItem,
+    StrategyLifecycleReview,
+    StrategyRiskEvent,
+    StrategyRiskSnapshot,
     StrategyVersionSpec,
 )
 
@@ -442,6 +454,96 @@ def test_upsert_strategy_version_and_activate() -> None:
     assert "UPDATE strategy_versions" in executed_sql
 
 
+def test_fetch_strategies_for_lifecycle_reads_status_filter() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchall_rows = [
+        {
+            "strategy_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "strategy_name": "sf-btc",
+            "asset_scope": "CRYPTO",
+            "status": "paper",
+            "live_candidate": False,
+            "strategy_version_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "version": 2,
+            "updated_at": datetime(2026, 2, 20, 12, 0, 0),
+        }
+    ]
+    repo = _repo_with_fake_conn(fake_conn)
+
+    rows = repo.fetch_strategies_for_lifecycle(statuses=["candidate", "paper"], limit=25)
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "paper"
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "FROM strategies s" in executed_sql
+    assert "WHERE s.status = ANY(%s::text[])" in executed_sql
+
+
+def test_fetch_strategy_paper_metrics_uses_intents_and_risk() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchone_value = {
+        "paper_days": 18,
+        "round_trips": 52,
+        "first_intent_at": datetime(2026, 1, 1, 0, 0, 0),
+        "last_intent_at": datetime(2026, 2, 20, 0, 0, 0),
+        "max_drawdown": -0.02,
+        "sharpe_20d": 0.35,
+    }
+    repo = _repo_with_fake_conn(fake_conn)
+
+    row = repo.fetch_strategy_paper_metrics(
+        strategy_version_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        lookback_days=365,
+    )
+
+    assert row["paper_days"] == 18
+    assert row["round_trips"] == 52
+    query = fake_conn._cursor.execute_calls[0][0]
+    assert "FROM order_intents oi" in query
+    assert "FROM strategy_risk_snapshots srs" in query
+
+
+def test_update_strategy_lifecycle_state_updates_status_and_live_candidate() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    repo.update_strategy_lifecycle_state(
+        strategy_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        status="paper",
+        live_candidate=True,
+    )
+
+    assert fake_conn.commit_count == 1
+    query, params = fake_conn._cursor.execute_calls[0]
+    assert "UPDATE strategies" in query
+    assert params == ("paper", True, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+
+def test_insert_strategy_lifecycle_review_persists_action_log() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchone_value = {"id": "11111111-1111-1111-1111-111111111111"}
+    repo = _repo_with_fake_conn(fake_conn)
+
+    review_id = repo.insert_strategy_lifecycle_review(
+        StrategyLifecycleReview(
+            strategy_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            strategy_version_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            action="approve_live",
+            from_status="paper",
+            to_status="live",
+            live_candidate=False,
+            reason="manual approval",
+            acted_by="ui-user",
+            metadata={"ticket": "TICKET-011"},
+        )
+    )
+
+    assert review_id == "11111111-1111-1111-1111-111111111111"
+    assert fake_conn.commit_count == 1
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "INSERT INTO strategy_lifecycle_reviews" in executed_sql
+
+
 def test_upsert_portfolio_and_order_intent() -> None:
     fake_conn = _FakeConnection()
     repo = _repo_with_fake_conn(fake_conn)
@@ -518,6 +620,25 @@ def test_fetch_approved_order_intents_returns_rows() -> None:
     assert "WHERE oi.status = 'approved'" in executed_sql
 
 
+def test_has_recent_open_intent_for_strategy_checks_recent_nonterminal_statuses() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchone_value = {"exists_flag": True}
+    repo = _repo_with_fake_conn(fake_conn)
+
+    exists = repo.has_recent_open_intent_for_strategy(
+        strategy_version_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        lookback_minutes=180,
+    )
+
+    assert exists is True
+    assert len(fake_conn._cursor.execute_calls) == 1
+    query, params = fake_conn._cursor.execute_calls[0]
+    assert "FROM order_intents oi" in query
+    assert "oi.status IN ('proposed', 'approved', 'sent', 'executing')" in query
+    assert "make_interval(mins => %s)" in query
+    assert params == ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 180)
+
+
 def test_update_order_intent_status_updates_row() -> None:
     fake_conn = _FakeConnection()
     repo = _repo_with_fake_conn(fake_conn)
@@ -552,3 +673,570 @@ def test_fetch_latest_price_for_symbol_uses_security_or_ticker() -> None:
     executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
     assert "JOIN LATERAL" in executed_sql
     assert "UPPER(s.ticker) = UPPER(%s)" in executed_sql
+
+
+def test_insert_edge_states_writes_ticket2_columns() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    inserted = repo.insert_edge_states(
+        [
+            EdgeState(
+                strategy_name="sf-jp-1111",
+                market_scope="JP_EQ",
+                symbol="JP:1111",
+                observed_at=datetime(2026, 2, 20, 9, 0, 0),
+                edge_score=72.5,
+                strategy_version_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                expected_net_edge=0.0125,
+                distance_to_entry=0.004,
+                confidence=0.82,
+                risk_json={"drawdown": 0.02},
+                explain="spread after costs is positive",
+                market_regime="risk_on",
+                meta={"source": "unit-test"},
+            )
+        ]
+    )
+
+    assert inserted == 1
+    assert fake_conn.commit_count == 1
+
+    edge_rows = [
+        rows
+        for sql, rows in fake_conn._cursor.executemany_calls
+        if "INSERT INTO edge_states" in sql
+    ]
+    assert len(edge_rows) == 1
+    assert len(edge_rows[0]) == 1
+
+    row = edge_rows[0][0]
+    assert row[0] == "sf-jp-1111"
+    assert row[6] == 0.0125
+    assert row[7] == 0.004
+    assert row[8] == 0.0125
+    assert row[9] == 0.004
+    assert row[14] == "risk_on"
+
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.executemany_calls)
+    assert "expected_net_edge" in executed_sql
+    assert "distance_to_entry" in executed_sql
+    assert "risk_json" in executed_sql
+    assert "market_regime" in executed_sql
+
+
+def test_fetch_latest_edge_state_for_strategy_uses_time_filter() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchone_value = {"id": "edge-id", "edge_score": 71.2}
+    repo = _repo_with_fake_conn(fake_conn)
+
+    row = repo.fetch_latest_edge_state_for_strategy(
+        strategy_version_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        at_or_before=datetime(2026, 2, 20, 12, 0, 0),
+    )
+
+    assert row is not None
+    assert row["id"] == "edge-id"
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "FROM edge_states" in executed_sql
+    assert "strategy_version_id = %s::uuid" in executed_sql
+    assert "observed_at <= %s" in executed_sql
+    assert "LIMIT 1" in executed_sql
+
+
+def test_fetch_edge_states_for_period_uses_strategy_and_window() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchall_rows = [{"id": "edge-1"}, {"id": "edge-2"}]
+    repo = _repo_with_fake_conn(fake_conn)
+
+    rows = repo.fetch_edge_states_for_period(
+        strategy_version_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        start_at=datetime(2026, 2, 1, 0, 0, 0),
+        end_at=datetime(2026, 2, 20, 0, 0, 0),
+        limit=500,
+    )
+
+    assert [r["id"] for r in rows] == ["edge-1", "edge-2"]
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "FROM edge_states" in executed_sql
+    assert "observed_at >= %s" in executed_sql
+    assert "observed_at <= %s" in executed_sql
+    assert "ORDER BY observed_at ASC" in executed_sql
+
+
+def test_create_idea_chain_and_evidence_persists_linked_rows() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    fake_conn._cursor.fetchone_value = {"id": "11111111-1111-1111-1111-111111111111"}
+    idea_id = repo.create_idea(
+        IdeaSpec(
+            source_type="youtube",
+            source_url="https://www.youtube.com/watch?v=abc",
+            title="半導体設備需要",
+            raw_text="2026年の投資見通し",
+            status="new",
+            priority=80,
+            created_by="discord-user",
+            metadata={"channel": "example"},
+        )
+    )
+    assert idea_id == "11111111-1111-1111-1111-111111111111"
+
+    fake_conn._cursor.fetchone_value = {"id": "22222222-2222-2222-2222-222222222222"}
+    evidence_id = repo.insert_idea_evidence(
+        IdeaEvidenceSpec(
+            idea_id=idea_id,
+            doc_version_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            excerpt="設備投資は前年比で回復。",
+            locator={"offset": 123},
+        )
+    )
+    assert evidence_id == "22222222-2222-2222-2222-222222222222"
+
+    fake_conn._cursor.fetchone_value = {"id": "33333333-3333-3333-3333-333333333333"}
+    experiment_id = repo.create_experiment(
+        ExperimentSpec(
+            idea_id=idea_id,
+            strategy_version_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            hypothesis="半導体設備株のモメンタム継続",
+            eval_status="queued",
+            metrics={"sharpe": 1.2},
+            artifacts={"notebook": "s3://bucket/a.ipynb"},
+        )
+    )
+    assert experiment_id == "33333333-3333-3333-3333-333333333333"
+
+    fake_conn._cursor.fetchone_value = {"id": "44444444-4444-4444-4444-444444444444"}
+    lesson_id = repo.create_lesson(
+        LessonSpec(
+            idea_id=idea_id,
+            experiment_id=experiment_id,
+            lesson_type="negative",
+            summary="イベント前後で逆張りは機能しない局面がある。",
+            reusable_checklist={"avoid_pre_earnings": True},
+        )
+    )
+    assert lesson_id == "44444444-4444-4444-4444-444444444444"
+
+    assert fake_conn.commit_count == 4
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "INSERT INTO ideas" in executed_sql
+    assert "INSERT INTO idea_evidence" in executed_sql
+    assert "INSERT INTO experiments" in executed_sql
+    assert "INSERT INTO lessons" in executed_sql
+
+
+def test_fetch_idea_claim_hashes_by_source_url_returns_normalized_set() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchall_rows = [
+        {"claim_hash": "abc123"},
+        {"claim_hash": "ABC123"},
+        {"claim_hash": ""},
+        {"claim_hash": None},
+    ]
+    repo = _repo_with_fake_conn(fake_conn)
+
+    output = repo.fetch_idea_claim_hashes_by_source_url(
+        source_type="youtube",
+        source_url="https://www.youtube.com/watch?v=abc",
+        limit=20,
+    )
+
+    assert output == {"abc123"}
+    assert len(fake_conn._cursor.execute_calls) == 1
+    query, params = fake_conn._cursor.execute_calls[0]
+    assert "metadata->>'claim_hash'" in query
+    assert "metadata ? 'claim_hash'" in query
+    assert params == ("youtube", "https://www.youtube.com/watch?v=abc", 20)
+
+
+def test_fetch_research_kanban_counts_merges_idea_and_strategy_statuses() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchall_rows = [
+        {"lane": "new", "cnt": 3},
+        {"lane": "candidate", "cnt": 4},
+        {"lane": "live", "cnt": 1},
+    ]
+    repo = _repo_with_fake_conn(fake_conn)
+
+    output = repo.fetch_research_kanban_counts()
+
+    assert output["new"] == 3
+    assert output["candidate"] == 4
+    assert output["live"] == 1
+    assert output["analyzing"] == 0
+    query, params = fake_conn._cursor.execute_calls[0]
+    assert "FROM ideas" in query
+    assert "FROM strategies" in query
+    assert "GROUP BY lane" in query
+    assert len(params) == 2
+
+
+def test_fetch_research_kanban_samples_returns_per_lane_titles() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchall_rows = [
+        {"lane": "new", "item_title": "youtube claim"},
+        {"lane": "candidate", "item_title": "sf-btc-main"},
+        {"lane": "candidate", "item_title": "sf-sol-main"},
+    ]
+    repo = _repo_with_fake_conn(fake_conn)
+
+    output = repo.fetch_research_kanban_samples(limit_per_lane=2)
+
+    assert output["new"] == ["youtube claim"]
+    assert output["candidate"] == ["sf-btc-main", "sf-sol-main"]
+    assert output["paper"] == []
+    query, params = fake_conn._cursor.execute_calls[0]
+    assert "idea_ranked" in query
+    assert "strategy_ranked" in query
+    assert "WHERE rn <= %s" in query
+    assert params[2] == 2
+
+
+def test_insert_and_fetch_strategy_risk_events() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    fake_conn._cursor.fetchone_value = {"id": "55555555-5555-5555-5555-555555555555"}
+    risk_event_id = repo.insert_strategy_risk_event(
+        StrategyRiskEvent(
+            strategy_version_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            event_type="dd_limit_breach",
+            payload={"drawdown": -0.035, "threshold": -0.03},
+            triggered_at=datetime(2026, 2, 20, 10, 30, 0),
+        )
+    )
+    assert risk_event_id == "55555555-5555-5555-5555-555555555555"
+
+    fake_conn._cursor.fetchall_rows = [
+        {
+            "id": "55555555-5555-5555-5555-555555555555",
+            "strategy_version_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "event_type": "dd_limit_breach",
+            "payload": {"drawdown": -0.035, "threshold": -0.03},
+            "triggered_at": datetime(2026, 2, 20, 10, 30, 0),
+            "created_at": datetime(2026, 2, 20, 10, 30, 0),
+        }
+    ]
+    rows = repo.fetch_strategy_risk_events(
+        strategy_version_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        limit=20,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["event_type"] == "dd_limit_breach"
+    assert fake_conn.commit_count == 1
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "INSERT INTO strategy_risk_events" in executed_sql
+    assert "FROM strategy_risk_events" in executed_sql
+
+
+def test_insert_edge_states_bulk_upserts_rows() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+    inserted = repo.insert_edge_states(
+        [
+            EdgeState(
+                strategy_name="edge-radar-equities",
+                strategy_version_id=None,
+                market_scope="JP_EQ",
+                symbol="JP:1111",
+                observed_at=datetime(2026, 2, 20, 11, 10, 0),
+                edge_score=72.5,
+                expected_net_edge_bps=4.5,
+                distance_to_entry_bps=0.0,
+                confidence=0.87,
+                risk={"missing_ratio": 0.1},
+                explain="JP:1111 edge_est=+4.50bps",
+                meta={"source": "unit-test"},
+            )
+        ]
+    )
+
+    assert inserted == 1
+    assert fake_conn.commit_count == 1
+    assert len(fake_conn._cursor.executemany_calls) == 1
+    query, rows = fake_conn._cursor.executemany_calls[0]
+    assert "INSERT INTO edge_states" in query
+    assert "ON CONFLICT (strategy_name, market_scope, symbol, observed_at)" in query
+    assert len(rows) == 1
+    assert rows[0][0] == "edge-radar-equities"
+    assert rows[0][3] == "JP:1111"
+
+
+def test_insert_edge_states_normalizes_edge_risk_schema_and_aliases() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    inserted = repo.insert_edge_states(
+        [
+            EdgeState(
+                strategy_name="edge-risk-normalize",
+                strategy_version_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                market_scope="CRYPTO",
+                symbol="CRYPTO:BTCUSDT.PERP.BINANCE",
+                observed_at=datetime(2026, 2, 20, 9, 15, 0),
+                edge_score=66.0,
+                expected_net_edge_bps=4.2,
+                distance_to_entry_bps=0.0,
+                confidence=0.73,
+                risk_json={
+                    "neutral_ok": True,
+                    "liquidity_score": 0.91,
+                    "custom_flag": "from-risk-json",
+                },
+                risk=EdgeRisk(
+                    missing_ratio=0.12,
+                    extra={"fallback_flag": "from-risk"},
+                ),
+                explain="normalized risk payload",
+                meta={},
+            )
+        ]
+    )
+
+    assert inserted == 1
+    query, rows = fake_conn._cursor.executemany_calls[0]
+    assert "INSERT INTO edge_states" in query
+    risk_payload = json.loads(rows[0][11])
+    assert risk_payload["delta_neutral_ok"] is True
+    assert risk_payload["liquidity_score"] == 0.91
+    assert risk_payload["missing_ratio"] == 0.12
+    assert risk_payload["extra"]["custom_flag"] == "from-risk-json"
+    assert risk_payload["extra"]["fallback_flag"] == "from-risk"
+
+
+def test_insert_crypto_market_snapshots_upserts_rows() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    inserted = repo.insert_crypto_market_snapshots(
+        [
+            CryptoMarketSnapshot(
+                exchange="binance",
+                symbol="BTCUSDT",
+                market_type="perp",
+                observed_at=datetime(2026, 2, 20, 12, 0, 0),
+                best_bid=100.0,
+                best_ask=100.2,
+                mid=100.1,
+                spread_bps=19.98,
+                funding_rate=0.0001,
+                open_interest=1000.0,
+                mark_price=100.15,
+                index_price=100.0,
+                basis_bps=15.0,
+                source_mode="rest",
+                latency_ms=120.0,
+                data_quality={"ws_failed": True},
+                raw_payload={"book": {"bidPrice": "100.0"}},
+            )
+        ]
+    )
+
+    assert inserted == 1
+    assert fake_conn.commit_count == 1
+    assert len(fake_conn._cursor.executemany_calls) == 1
+    query, rows = fake_conn._cursor.executemany_calls[0]
+    assert "INSERT INTO crypto_market_snapshots" in query
+    assert "ON CONFLICT (exchange, symbol, market_type, observed_at)" in query
+    assert len(rows) == 1
+    assert rows[0][0] == "binance"
+    assert rows[0][1] == "BTCUSDT"
+    assert rows[0][2] == "perp"
+
+
+def test_insert_crypto_data_quality_snapshots_upserts_rows() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    inserted = repo.insert_crypto_data_quality_snapshots(
+        [
+            CryptoDataQualitySnapshot(
+                exchange="binance",
+                symbol="BTCUSDT",
+                market_type="perp",
+                window_start=datetime(2026, 2, 20, 11, 59, 0),
+                window_end=datetime(2026, 2, 20, 12, 0, 0),
+                sample_count=3,
+                missing_count=0,
+                missing_ratio=0.0,
+                latency_p95_ms=120.0,
+                ws_failover_count=1,
+                eligible_for_edge=True,
+                details={"source_mode": "rest"},
+            )
+        ]
+    )
+
+    assert inserted == 1
+    assert fake_conn.commit_count == 1
+    assert len(fake_conn._cursor.executemany_calls) == 1
+    query, rows = fake_conn._cursor.executemany_calls[0]
+    assert "INSERT INTO crypto_data_quality" in query
+    assert "ON CONFLICT (exchange, symbol, market_type, window_start, window_end)" in query
+    assert len(rows) == 1
+    assert rows[0][0] == "binance"
+    assert rows[0][1] == "BTCUSDT"
+    assert rows[0][2] == "perp"
+
+
+def test_fetch_crypto_market_inputs_for_edge_uses_quality_filters() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchall_rows = [
+        {"exchange": "binance", "symbol": "BTCUSDT", "market_type": "perp"},
+        {"exchange": "hyperliquid", "symbol": "BTC", "market_type": "perp"},
+    ]
+    repo = _repo_with_fake_conn(fake_conn)
+
+    rows = repo.fetch_crypto_market_inputs_for_edge(
+        max_missing_ratio=0.1,
+        max_latency_ms=500.0,
+        lookback_minutes=30,
+        limit=10,
+    )
+
+    assert len(rows) == 2
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "latest_snapshots" in executed_sql
+    assert "latest_quality" in executed_sql
+    assert "COALESCE(lq.missing_ratio, 0.0) <= %s" in executed_sql
+    assert "COALESCE(lq.latency_p95_ms, 0.0) <= %s" in executed_sql
+
+
+def test_fetch_positions_for_portfolio_returns_rows() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchall_rows = [
+        {
+            "symbol": "JP:1111",
+            "instrument_type": "JP_EQ",
+            "qty": 10.0,
+            "avg_price": 1000.0,
+            "last_price": 1010.0,
+            "market_value": 10100.0,
+            "unrealized_pnl": 100.0,
+            "realized_pnl": 0.0,
+            "updated_at": datetime(2026, 2, 20, 10, 0, 0),
+        }
+    ]
+    repo = _repo_with_fake_conn(fake_conn)
+
+    rows = repo.fetch_positions_for_portfolio(
+        portfolio_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        symbols=["JP:1111"],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "JP:1111"
+    query = fake_conn._cursor.execute_calls[0][0]
+    assert "FROM positions" in query
+    assert "portfolio_id = %s::uuid" in query
+
+
+def test_fetch_open_orders_for_portfolio_returns_rows() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchall_rows = [
+        {
+            "order_id": "ord-1",
+            "intent_id": "intent-1",
+            "broker": "gateway_jp",
+            "symbol": "JP:7203",
+            "instrument_type": "JP_EQ",
+            "side": "BUY",
+            "qty": 100.0,
+            "status": "ack",
+            "submitted_at": datetime(2026, 2, 20, 10, 0, 0),
+            "updated_at": datetime(2026, 2, 20, 10, 1, 0),
+            "meta": {},
+        }
+    ]
+    repo = _repo_with_fake_conn(fake_conn)
+
+    rows = repo.fetch_open_orders_for_portfolio(
+        portfolio_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        symbols=["JP:7203"],
+        limit=20,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "ack"
+    query = fake_conn._cursor.execute_calls[0][0]
+    assert "FROM orders o" in query
+    assert "JOIN order_intents oi" in query
+    assert "o.status IN ('new', 'sent', 'ack', 'partially_filled')" in query
+
+
+def test_upsert_and_fetch_strategy_risk_snapshots() -> None:
+    fake_conn = _FakeConnection()
+    repo = _repo_with_fake_conn(fake_conn)
+
+    fake_conn._cursor.fetchone_value = {"id": "99999999-9999-9999-9999-999999999999"}
+    snapshot_id = repo.upsert_strategy_risk_snapshot(
+        StrategyRiskSnapshot(
+            strategy_version_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            as_of=datetime(2026, 2, 20, 12, 0, 0),
+            drawdown=-0.031,
+            sharpe_20d=-0.05,
+            state="halted",
+            trigger_flags={"drawdown_breach": True},
+            cooldown_until=datetime(2026, 2, 21, 12, 0, 0),
+        )
+    )
+    assert snapshot_id == "99999999-9999-9999-9999-999999999999"
+
+    fake_conn._cursor.fetchone_value = {
+        "id": "99999999-9999-9999-9999-999999999999",
+        "strategy_version_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "state": "halted",
+    }
+    latest = repo.fetch_latest_strategy_risk_snapshot(
+        strategy_version_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    )
+    assert latest is not None
+    assert latest["state"] == "halted"
+
+    fake_conn._cursor.fetchall_rows = [
+        {
+            "id": "99999999-9999-9999-9999-999999999999",
+            "strategy_version_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "as_of": datetime(2026, 2, 20, 12, 0, 0),
+            "as_of_date": date(2026, 2, 20),
+            "drawdown": -0.031,
+            "sharpe_20d": -0.05,
+            "state": "halted",
+            "trigger_flags": {"drawdown_breach": True},
+            "cooldown_until": datetime(2026, 2, 21, 12, 0, 0),
+            "created_at": datetime(2026, 2, 20, 12, 0, 0),
+        }
+    ]
+    rows = repo.fetch_recent_strategy_risk_snapshots(
+        strategy_version_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        limit=20,
+    )
+    assert len(rows) == 1
+    assert rows[0]["state"] == "halted"
+
+    executed_sql = "\n".join(call[0] for call in fake_conn._cursor.execute_calls)
+    assert "INSERT INTO strategy_risk_snapshots" in executed_sql
+    assert "FROM strategy_risk_snapshots" in executed_sql
+
+
+def test_fetch_strategy_symbols_for_portfolio_uses_jsonb_targets() -> None:
+    fake_conn = _FakeConnection()
+    fake_conn._cursor.fetchall_rows = [
+        {"symbol": "JP:7203", "instrument_type": "JP_EQ"},
+        {"symbol": "US:AAPL", "instrument_type": "US_EQ"},
+    ]
+    repo = _repo_with_fake_conn(fake_conn)
+
+    rows = repo.fetch_strategy_symbols_for_portfolio(
+        strategy_version_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        portfolio_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        lookback_days=14,
+    )
+
+    assert len(rows) == 2
+    query = fake_conn._cursor.execute_calls[0][0]
+    assert "jsonb_array_elements(oi.target_positions)" in query
+    assert "oi.strategy_version_id = %s::uuid" in query
