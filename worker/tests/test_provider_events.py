@@ -12,6 +12,7 @@ def _secrets() -> RuntimeSecrets:
     return RuntimeSecrets(
         database_url="postgresql://placeholder",
         discord_webhook_url=None,
+        discord_bot_token=None,
         openai_api_key=None,
         r2_account_id=None,
         r2_access_key_id=None,

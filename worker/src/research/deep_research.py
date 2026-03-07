@@ -26,6 +26,7 @@ class DeepResearchInput:
     security_id: str
     report_text: str
     source: str = "deep_research"
+    report_path: str | None = None
 
 
 def _resolve_model(model: str | None) -> str:
@@ -127,4 +128,8 @@ def parse_deep_research_file_if_configured() -> DeepResearchInput | None:
     report_text = path.read_text(encoding="utf-8", errors="ignore").strip()
     if not report_text:
         return None
-    return DeepResearchInput(security_id=security_id, report_text=report_text)
+    return DeepResearchInput(
+        security_id=security_id,
+        report_text=report_text,
+        report_path=str(path),
+    )

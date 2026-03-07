@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import hashlib
 import json
 from typing import Any, Iterator
@@ -15,17 +15,33 @@ from psycopg.rows import dict_row
 from src.types import (
     BacktestResult,
     CitationItem,
+    CryptoDataQualitySnapshot,
+    CryptoMarketSnapshot,
+    EdgeRisk,
+    EdgeState,
+    ExperimentSpec,
     EventItem,
     FillRecord,
     FundamentalSnapshot,
+    IdeaEvidenceSpec,
+    IdeaSpec,
+    LessonSpec,
     OrderIntent,
     OrderRecord,
     PortfolioSpec,
+    ResearchArtifactSpec,
+    ResearchArtifactRunSpec,
+    ResearchExternalInput,
+    ResearchHypothesisOutcomeSpec,
+    ResearchHypothesisSpec,
     PositionRecord,
     ReportItem,
     RiskSnapshot,
     Security,
     StrategyEvaluation,
+    StrategyLifecycleReview,
+    StrategyRiskEvent,
+    StrategyRiskSnapshot,
     StrategySpec,
     StrategyVersionSpec,
 )
@@ -34,6 +50,31 @@ from src.types import (
 def _chunks(seq: list[Any], size: int = 1000) -> Iterator[list[Any]]:
     for i in range(0, len(seq), size):
         yield seq[i : i + size]
+
+
+def _normalize_edge_risk_payload(value: Any) -> dict[str, Any]:
+    return EdgeRisk.from_mapping(value).to_dict()
+
+
+def _merge_edge_risk_payload(
+    primary: dict[str, Any],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    keys = set(primary.keys()) | set(fallback.keys())
+    for key in keys:
+        if key == "extra":
+            merged_extra: dict[str, Any] = {}
+            if isinstance(fallback.get("extra"), dict):
+                merged_extra.update(dict(fallback["extra"]))
+            if isinstance(primary.get("extra"), dict):
+                merged_extra.update(dict(primary["extra"]))
+            output[key] = merged_extra
+            continue
+        primary_value = primary.get(key)
+        fallback_value = fallback.get(key)
+        output[key] = primary_value if primary_value is not None else fallback_value
+    return output
 
 
 class NeonRepository:
@@ -59,6 +100,19 @@ class NeonRepository:
             run_id = cur.fetchone()["id"]
             conn.commit()
         return run_id
+
+    def create_chat_session(self, title: str | None = None) -> str:
+        session_id = str(uuid4())
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO chat_sessions (id, title)
+                VALUES (%s::uuid, %s)
+                """,
+                (session_id, title),
+            )
+            conn.commit()
+        return session_id
 
     def finish_run(self, run_id: str, status: str, metadata: dict[str, Any] | None = None) -> None:
         with self._conn() as conn, conn.cursor() as cur:
@@ -310,6 +364,279 @@ class NeonRepository:
             )
             conn.commit()
 
+    def insert_crypto_market_snapshots(self, snapshots: list[CryptoMarketSnapshot]) -> int:
+        if not snapshots:
+            return 0
+
+        rows = [
+            (
+                s.exchange,
+                s.symbol,
+                s.market_type,
+                s.observed_at,
+                s.best_bid,
+                s.best_ask,
+                s.mid,
+                s.spread_bps,
+                s.funding_rate,
+                s.open_interest,
+                s.mark_price,
+                s.index_price,
+                s.basis_bps,
+                s.source_mode,
+                s.latency_ms,
+                json.dumps(s.data_quality or {}),
+                json.dumps(s.raw_payload or {}),
+            )
+            for s in snapshots
+        ]
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO crypto_market_snapshots (
+                    exchange,
+                    symbol,
+                    market_type,
+                    observed_at,
+                    best_bid,
+                    best_ask,
+                    mid,
+                    spread_bps,
+                    funding_rate,
+                    open_interest,
+                    mark_price,
+                    index_price,
+                    basis_bps,
+                    source_mode,
+                    latency_ms,
+                    data_quality,
+                    raw_payload
+                )
+                VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s::jsonb, %s::jsonb
+                )
+                ON CONFLICT (exchange, symbol, market_type, observed_at)
+                DO UPDATE SET best_bid = EXCLUDED.best_bid,
+                              best_ask = EXCLUDED.best_ask,
+                              mid = EXCLUDED.mid,
+                              spread_bps = EXCLUDED.spread_bps,
+                              funding_rate = EXCLUDED.funding_rate,
+                              open_interest = EXCLUDED.open_interest,
+                              mark_price = EXCLUDED.mark_price,
+                              index_price = EXCLUDED.index_price,
+                              basis_bps = EXCLUDED.basis_bps,
+                              source_mode = EXCLUDED.source_mode,
+                              latency_ms = EXCLUDED.latency_ms,
+                              data_quality = EXCLUDED.data_quality,
+                              raw_payload = EXCLUDED.raw_payload
+                """,
+                rows,
+            )
+            conn.commit()
+        return len(rows)
+
+    def insert_crypto_data_quality_snapshots(self, rows: list[CryptoDataQualitySnapshot]) -> int:
+        if not rows:
+            return 0
+
+        values = [
+            (
+                r.exchange,
+                r.symbol,
+                r.market_type,
+                r.window_start,
+                r.window_end,
+                int(r.sample_count),
+                int(r.missing_count),
+                float(r.missing_ratio),
+                r.latency_p95_ms,
+                int(r.ws_failover_count),
+                bool(r.eligible_for_edge),
+                json.dumps(r.details or {}),
+            )
+            for r in rows
+        ]
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO crypto_data_quality (
+                    exchange,
+                    symbol,
+                    market_type,
+                    window_start,
+                    window_end,
+                    sample_count,
+                    missing_count,
+                    missing_ratio,
+                    latency_p95_ms,
+                    ws_failover_count,
+                    eligible_for_edge,
+                    details
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s::jsonb
+                )
+                ON CONFLICT (exchange, symbol, market_type, window_start, window_end)
+                DO UPDATE SET sample_count = EXCLUDED.sample_count,
+                              missing_count = EXCLUDED.missing_count,
+                              missing_ratio = EXCLUDED.missing_ratio,
+                              latency_p95_ms = EXCLUDED.latency_p95_ms,
+                              ws_failover_count = EXCLUDED.ws_failover_count,
+                              eligible_for_edge = EXCLUDED.eligible_for_edge,
+                              details = EXCLUDED.details
+                """,
+                values,
+            )
+            conn.commit()
+        return len(values)
+
+    def fetch_latest_crypto_market_snapshots(
+        self,
+        exchanges: list[str] | None = None,
+        symbols: list[str] | None = None,
+        market_type: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        exchange_filter = [str(x).strip().lower() for x in (exchanges or []) if str(x).strip()]
+        symbol_filter = [str(x).strip().upper() for x in (symbols or []) if str(x).strip()]
+        market_type_filter = str(market_type).strip().lower() if market_type is not None else None
+        if market_type_filter == "":
+            market_type_filter = None
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    exchange,
+                    symbol,
+                    market_type,
+                    observed_at,
+                    best_bid,
+                    best_ask,
+                    mid,
+                    spread_bps,
+                    funding_rate,
+                    open_interest,
+                    mark_price,
+                    index_price,
+                    basis_bps,
+                    source_mode,
+                    latency_ms,
+                    data_quality,
+                    raw_payload,
+                    created_at
+                FROM crypto_market_snapshots
+                WHERE (%s::text[] IS NULL OR exchange = ANY(%s))
+                  AND (%s::text[] IS NULL OR symbol = ANY(%s))
+                  AND (%s::text IS NULL OR market_type = %s)
+                ORDER BY observed_at DESC, exchange, symbol, market_type
+                LIMIT %s
+                """,
+                (
+                    exchange_filter if exchange_filter else None,
+                    exchange_filter if exchange_filter else None,
+                    symbol_filter if symbol_filter else None,
+                    symbol_filter if symbol_filter else None,
+                    market_type_filter,
+                    market_type_filter,
+                    max(1, int(limit)),
+                ),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def fetch_crypto_market_inputs_for_edge(
+        self,
+        max_missing_ratio: float = 0.25,
+        max_latency_ms: float = 3000.0,
+        lookback_minutes: int = 60,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH latest_snapshots AS (
+                    SELECT DISTINCT ON (exchange, symbol, market_type)
+                        id::text AS id,
+                        exchange,
+                        symbol,
+                        market_type,
+                        observed_at,
+                        best_bid,
+                        best_ask,
+                        mid,
+                        spread_bps,
+                        funding_rate,
+                        open_interest,
+                        mark_price,
+                        index_price,
+                        basis_bps,
+                        source_mode,
+                        latency_ms,
+                        data_quality,
+                        raw_payload,
+                        created_at
+                    FROM crypto_market_snapshots
+                    WHERE observed_at >= NOW() - (%s::int * INTERVAL '1 minute')
+                    ORDER BY exchange, symbol, market_type, observed_at DESC
+                ),
+                latest_quality AS (
+                    SELECT DISTINCT ON (exchange, symbol, market_type)
+                        exchange,
+                        symbol,
+                        market_type,
+                        window_end,
+                        sample_count,
+                        missing_count,
+                        missing_ratio,
+                        latency_p95_ms,
+                        ws_failover_count,
+                        eligible_for_edge,
+                        details
+                    FROM crypto_data_quality
+                    WHERE window_end >= NOW() - (%s::int * INTERVAL '1 minute')
+                    ORDER BY exchange, symbol, market_type, window_end DESC
+                )
+                SELECT
+                    ls.*,
+                    lq.window_end,
+                    lq.sample_count,
+                    lq.missing_count,
+                    lq.missing_ratio,
+                    lq.latency_p95_ms,
+                    lq.ws_failover_count,
+                    lq.eligible_for_edge,
+                    lq.details AS quality_details
+                FROM latest_snapshots ls
+                LEFT JOIN latest_quality lq
+                  ON lq.exchange = ls.exchange
+                 AND lq.symbol = ls.symbol
+                 AND lq.market_type = ls.market_type
+                WHERE COALESCE(lq.missing_ratio, 0.0) <= %s
+                  AND COALESCE(lq.latency_p95_ms, 0.0) <= %s
+                  AND COALESCE(lq.eligible_for_edge, TRUE) = TRUE
+                ORDER BY ls.observed_at DESC, ls.exchange, ls.symbol, ls.market_type
+                LIMIT %s
+                """,
+                (
+                    max(1, int(lookback_minutes)),
+                    max(1, int(lookback_minutes)),
+                    float(max_missing_ratio),
+                    float(max_latency_ms),
+                    max(1, int(limit)),
+                ),
+            )
+            rows = cur.fetchall()
+        return rows
+
     def insert_scores(self, run_id: str, score_df: pd.DataFrame, security_uuid_map: dict[str, str]) -> None:
         if score_df.empty:
             return
@@ -544,6 +871,78 @@ class NeonRepository:
                 f"mock/evidence/{doc_version_id}.chunk.txt",
             ),
         )
+
+    def upsert_document_with_version(
+        self,
+        *,
+        external_doc_id: str,
+        source_system: str,
+        source_url: str,
+        title: str | None,
+        published_at: datetime | None,
+        retrieved_at: datetime | None,
+        sha256: str,
+        mime_type: str,
+        r2_object_key: str,
+        r2_text_key: str | None = None,
+        page_count: int | None = None,
+    ) -> str:
+        normalized_sha = str(sha256).strip().lower()
+        if len(normalized_sha) != 64:
+            raise ValueError("sha256 must be a 64-char hex string")
+
+        fetched_at = retrieved_at or datetime.utcnow()
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO documents (
+                    external_doc_id, source_system, source_url, title, published_at
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (source_system, external_doc_id)
+                DO UPDATE SET source_url = EXCLUDED.source_url,
+                              title = COALESCE(EXCLUDED.title, documents.title),
+                              published_at = COALESCE(EXCLUDED.published_at, documents.published_at)
+                RETURNING id::text
+                """,
+                (
+                    external_doc_id,
+                    source_system,
+                    source_url,
+                    title,
+                    published_at,
+                ),
+            )
+            doc_id = cur.fetchone()["id"]
+
+            cur.execute(
+                """
+                INSERT INTO document_versions (
+                    document_id, retrieved_at, sha256, mime_type, r2_object_key, r2_text_key, page_count
+                )
+                VALUES (%s::uuid, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (document_id, sha256)
+                DO UPDATE SET retrieved_at = EXCLUDED.retrieved_at,
+                              mime_type = EXCLUDED.mime_type,
+                              r2_object_key = EXCLUDED.r2_object_key,
+                              r2_text_key = EXCLUDED.r2_text_key,
+                              page_count = EXCLUDED.page_count
+                RETURNING id::text
+                """,
+                (
+                    doc_id,
+                    fetched_at,
+                    normalized_sha,
+                    mime_type,
+                    r2_object_key,
+                    r2_text_key,
+                    page_count,
+                ),
+            )
+            doc_version_id = cur.fetchone()["id"]
+            conn.commit()
+
+        return doc_version_id
 
     def insert_events(
         self,
@@ -1050,7 +1449,12 @@ class NeonRepository:
                 ON CONFLICT (name)
                 DO UPDATE SET description = EXCLUDED.description,
                               asset_scope = EXCLUDED.asset_scope,
-                              status = EXCLUDED.status,
+                              status = CASE
+                                  WHEN strategies.status IN ('approved', 'paper', 'live', 'paused', 'retired')
+                                       AND EXCLUDED.status IN ('draft', 'candidate')
+                                  THEN strategies.status
+                                  ELSE EXCLUDED.status
+                              END,
                               updated_at = NOW()
                 RETURNING id::text
                 """,
@@ -1064,6 +1468,178 @@ class NeonRepository:
             strategy_id = cur.fetchone()["id"]
             conn.commit()
         return strategy_id
+
+    def fetch_strategies_for_lifecycle(
+        self,
+        statuses: list[str] | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        status_values = statuses or ["candidate", "approved", "paper"]
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH latest_versions AS (
+                    SELECT DISTINCT ON (sv.strategy_id)
+                        sv.strategy_id,
+                        sv.id::text AS strategy_version_id,
+                        sv.version
+                    FROM strategy_versions sv
+                    ORDER BY sv.strategy_id, sv.version DESC
+                )
+                SELECT
+                    s.id::text AS strategy_id,
+                    s.name AS strategy_name,
+                    s.asset_scope,
+                    s.status,
+                    s.live_candidate,
+                    lv.strategy_version_id,
+                    lv.version,
+                    s.updated_at
+                FROM strategies s
+                LEFT JOIN latest_versions lv
+                  ON lv.strategy_id = s.id
+                WHERE s.status = ANY(%s::text[])
+                ORDER BY s.updated_at DESC
+                LIMIT %s
+                """,
+                (status_values, max(1, int(limit))),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def fetch_strategy_paper_metrics(
+        self,
+        strategy_version_id: str,
+        lookback_days: int = 365,
+    ) -> dict[str, Any]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH intents AS (
+                    SELECT
+                        oi.as_of,
+                        oi.as_of::date AS intent_day,
+                        oi.status
+                    FROM order_intents oi
+                    WHERE oi.strategy_version_id = %s::uuid
+                      AND oi.as_of >= NOW() - make_interval(days => %s)
+                      AND oi.status IN ('sent', 'done')
+                ),
+                risk AS (
+                    SELECT
+                        srs.as_of,
+                        srs.drawdown,
+                        srs.sharpe_20d
+                    FROM strategy_risk_snapshots srs
+                    WHERE srs.strategy_version_id = %s::uuid
+                      AND srs.as_of >= NOW() - make_interval(days => %s)
+                ),
+                latest_risk AS (
+                    SELECT
+                        sharpe_20d
+                    FROM risk
+                    ORDER BY as_of DESC
+                    LIMIT 1
+                )
+                SELECT
+                    COALESCE(COUNT(DISTINCT intents.intent_day), 0)::int AS paper_days,
+                    COALESCE(COUNT(*) FILTER (WHERE intents.status = 'done'), 0)::int AS round_trips,
+                    MIN(intents.as_of) AS first_intent_at,
+                    MAX(intents.as_of) AS last_intent_at,
+                    (SELECT MIN(drawdown) FROM risk WHERE drawdown IS NOT NULL) AS max_drawdown,
+                    (SELECT sharpe_20d FROM latest_risk) AS sharpe_20d
+                FROM intents
+                """,
+                (
+                    strategy_version_id,
+                    max(1, int(lookback_days)),
+                    strategy_version_id,
+                    max(1, int(lookback_days)),
+                ),
+            )
+            row = cur.fetchone()
+        return row or {
+            "paper_days": 0,
+            "round_trips": 0,
+            "first_intent_at": None,
+            "last_intent_at": None,
+            "max_drawdown": None,
+            "sharpe_20d": None,
+        }
+
+    def update_strategy_lifecycle_state(
+        self,
+        *,
+        strategy_id: str,
+        status: str,
+        live_candidate: bool,
+    ) -> None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE strategies
+                SET status = %s,
+                    live_candidate = %s,
+                    updated_at = NOW()
+                WHERE id = %s::uuid
+                """,
+                (status, live_candidate, strategy_id),
+            )
+            conn.commit()
+
+    def insert_strategy_lifecycle_review(self, review: StrategyLifecycleReview) -> str:
+        acted_at = review.acted_at or datetime.now(timezone.utc)
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO strategy_lifecycle_reviews (
+                    strategy_id,
+                    strategy_version_id,
+                    action,
+                    from_status,
+                    to_status,
+                    live_candidate,
+                    reason,
+                    recheck_condition,
+                    recheck_after,
+                    acted_by,
+                    acted_at,
+                    metadata
+                )
+                VALUES (
+                    %s::uuid,
+                    %s::uuid,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s::jsonb
+                )
+                RETURNING id::text
+                """,
+                (
+                    review.strategy_id,
+                    review.strategy_version_id,
+                    review.action,
+                    review.from_status,
+                    review.to_status,
+                    review.live_candidate,
+                    review.reason,
+                    review.recheck_condition,
+                    review.recheck_after,
+                    review.acted_by,
+                    acted_at,
+                    json.dumps(review.metadata),
+                ),
+            )
+            review_id = cur.fetchone()["id"]
+            conn.commit()
+        return review_id
 
     def upsert_strategy_version(self, version: StrategyVersionSpec) -> str:
         with self._conn() as conn, conn.cursor() as cur:
@@ -1145,6 +1721,537 @@ class NeonRepository:
             evaluation_id = cur.fetchone()["id"]
             conn.commit()
         return evaluation_id
+
+    def insert_edge_states(self, states: list[EdgeState]) -> int:
+        if not states:
+            return 0
+
+        rows = []
+        for state in states:
+            expected_net_edge = state.expected_net_edge
+            if expected_net_edge is None:
+                expected_net_edge = state.expected_net_edge_bps
+
+            distance_to_entry = state.distance_to_entry
+            if distance_to_entry is None:
+                distance_to_entry = state.distance_to_entry_bps
+
+            risk_payload = _merge_edge_risk_payload(
+                _normalize_edge_risk_payload(state.risk_json),
+                _normalize_edge_risk_payload(state.risk),
+            )
+            market_regime = state.market_regime or state.market_scope
+
+            rows.append(
+                (
+                    state.strategy_name,
+                    state.strategy_version_id,
+                    state.market_scope,
+                    state.symbol,
+                    state.observed_at,
+                    float(state.edge_score),
+                    float(expected_net_edge) if expected_net_edge is not None else None,
+                    float(distance_to_entry) if distance_to_entry is not None else None,
+                    float(expected_net_edge) if expected_net_edge is not None else None,
+                    float(distance_to_entry) if distance_to_entry is not None else None,
+                    float(state.confidence) if state.confidence is not None else None,
+                    json.dumps(risk_payload),
+                    json.dumps(risk_payload),
+                    state.explain,
+                    market_regime,
+                    json.dumps(state.meta or {}),
+                )
+            )
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO edge_states (
+                    strategy_name,
+                    strategy_version_id,
+                    market_scope,
+                    symbol,
+                    observed_at,
+                    edge_score,
+                    expected_net_edge,
+                    distance_to_entry,
+                    expected_net_edge_bps,
+                    distance_to_entry_bps,
+                    confidence,
+                    risk_json,
+                    risk,
+                    explain,
+                    market_regime,
+                    meta
+                )
+                VALUES (
+                    %s,
+                    %s::uuid,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s::jsonb,
+                    %s::jsonb,
+                    %s,
+                    %s,
+                    %s::jsonb
+                )
+                ON CONFLICT (strategy_name, market_scope, symbol, observed_at)
+                DO UPDATE SET strategy_version_id = EXCLUDED.strategy_version_id,
+                              edge_score = EXCLUDED.edge_score,
+                              expected_net_edge = EXCLUDED.expected_net_edge,
+                              distance_to_entry = EXCLUDED.distance_to_entry,
+                              expected_net_edge_bps = EXCLUDED.expected_net_edge_bps,
+                              distance_to_entry_bps = EXCLUDED.distance_to_entry_bps,
+                              confidence = EXCLUDED.confidence,
+                              risk_json = EXCLUDED.risk_json,
+                              risk = EXCLUDED.risk,
+                              explain = EXCLUDED.explain,
+                              market_regime = EXCLUDED.market_regime,
+                              meta = EXCLUDED.meta
+                """,
+                rows,
+            )
+            conn.commit()
+        return len(rows)
+
+    def create_idea(self, idea: IdeaSpec) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ideas (
+                    source_type, source_url, title, raw_text, status, priority, created_by, metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                RETURNING id::text
+                """,
+                (
+                    idea.source_type,
+                    idea.source_url,
+                    idea.title,
+                    idea.raw_text,
+                    idea.status,
+                    int(idea.priority),
+                    idea.created_by,
+                    json.dumps(idea.metadata),
+                ),
+            )
+            idea_id = cur.fetchone()["id"]
+            conn.commit()
+        return idea_id
+
+    def fetch_idea_claim_hashes_by_source_url(
+        self,
+        *,
+        source_type: str,
+        source_url: str,
+        limit: int = 1000,
+    ) -> set[str]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    metadata->>'claim_hash' AS claim_hash
+                FROM ideas
+                WHERE source_type = %s
+                  AND source_url = %s
+                  AND metadata ? 'claim_hash'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (source_type, source_url, max(1, int(limit))),
+            )
+            rows = cur.fetchall()
+
+        output: set[str] = set()
+        for row in rows:
+            raw_value = (row or {}).get("claim_hash")
+            if raw_value is None:
+                continue
+            value = str(raw_value).strip().lower()
+            if value:
+                output.add(value)
+        return output
+
+    def fetch_idea(self, idea_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    source_type,
+                    source_url,
+                    title,
+                    raw_text,
+                    status,
+                    priority,
+                    created_by,
+                    metadata,
+                    created_at,
+                    updated_at
+                FROM ideas
+                WHERE id = %s::uuid
+                LIMIT 1
+                """,
+                (idea_id,),
+            )
+            row = cur.fetchone()
+        return row
+
+    def fetch_research_kanban_counts(self, statuses: list[str] | None = None) -> dict[str, int]:
+        lanes = statuses or ["new", "analyzing", "rejected", "candidate", "paper", "live"]
+        normalized_lanes = [str(status).strip() for status in lanes if str(status).strip()]
+        if not normalized_lanes:
+            normalized_lanes = ["new", "analyzing", "rejected", "candidate", "paper", "live"]
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH lane_rows AS (
+                    SELECT status AS lane
+                    FROM ideas
+                    WHERE status = ANY(%s::text[])
+                    UNION ALL
+                    SELECT status AS lane
+                    FROM strategies
+                    WHERE status = ANY(%s::text[])
+                )
+                SELECT lane, COUNT(*)::int AS cnt
+                FROM lane_rows
+                GROUP BY lane
+                """,
+                (normalized_lanes, normalized_lanes),
+            )
+            rows = cur.fetchall()
+
+        output = {lane: 0 for lane in normalized_lanes}
+        for row in rows:
+            lane = str((row or {}).get("lane", "")).strip()
+            if not lane:
+                continue
+            try:
+                output[lane] = int((row or {}).get("cnt", 0) or 0)
+            except (TypeError, ValueError):
+                output[lane] = 0
+        return output
+
+    def fetch_research_kanban_samples(
+        self,
+        *,
+        statuses: list[str] | None = None,
+        limit_per_lane: int = 3,
+    ) -> dict[str, list[str]]:
+        lanes = statuses or ["new", "analyzing", "rejected", "candidate", "paper", "live"]
+        normalized_lanes = [str(status).strip() for status in lanes if str(status).strip()]
+        if not normalized_lanes:
+            normalized_lanes = ["new", "analyzing", "rejected", "candidate", "paper", "live"]
+        lane_limit = max(1, int(limit_per_lane))
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH idea_ranked AS (
+                    SELECT
+                        status AS lane,
+                        title AS item_title,
+                        ROW_NUMBER() OVER (PARTITION BY status ORDER BY priority DESC, created_at DESC) AS rn
+                    FROM ideas
+                    WHERE status = ANY(%s::text[])
+                ),
+                strategy_ranked AS (
+                    SELECT
+                        status AS lane,
+                        name AS item_title,
+                        ROW_NUMBER() OVER (PARTITION BY status ORDER BY updated_at DESC, created_at DESC) AS rn
+                    FROM strategies
+                    WHERE status = ANY(%s::text[])
+                ),
+                merged AS (
+                    SELECT lane, item_title, rn FROM idea_ranked
+                    UNION ALL
+                    SELECT lane, item_title, rn FROM strategy_ranked
+                )
+                SELECT lane, item_title
+                FROM merged
+                WHERE rn <= %s
+                ORDER BY lane, rn
+                """,
+                (normalized_lanes, normalized_lanes, lane_limit),
+            )
+            rows = cur.fetchall()
+
+        output = {lane: [] for lane in normalized_lanes}
+        for row in rows:
+            lane = str((row or {}).get("lane", "")).strip()
+            if not lane:
+                continue
+            title = str((row or {}).get("item_title", "")).strip()
+            if not title:
+                continue
+            if lane not in output:
+                output[lane] = []
+            output[lane].append(title)
+        return output
+
+    def update_idea_status(self, idea_id: str, status: str) -> None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ideas
+                SET status = %s,
+                    updated_at = NOW()
+                WHERE id = %s::uuid
+                """,
+                (status, idea_id),
+            )
+            conn.commit()
+
+    def insert_idea_evidence(self, evidence: IdeaEvidenceSpec) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO idea_evidence (
+                    idea_id, doc_version_id, excerpt, locator
+                )
+                VALUES (%s::uuid, %s::uuid, %s, %s::jsonb)
+                RETURNING id::text
+                """,
+                (
+                    evidence.idea_id,
+                    evidence.doc_version_id,
+                    evidence.excerpt,
+                    json.dumps(evidence.locator),
+                ),
+            )
+            idea_evidence_id = cur.fetchone()["id"]
+            conn.commit()
+        return idea_evidence_id
+
+    def create_experiment(self, experiment: ExperimentSpec) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO experiments (
+                    idea_id, strategy_version_id, hypothesis, eval_status, metrics, artifacts
+                )
+                VALUES (%s::uuid, %s::uuid, %s, %s, %s::jsonb, %s::jsonb)
+                RETURNING id::text
+                """,
+                (
+                    experiment.idea_id,
+                    experiment.strategy_version_id,
+                    experiment.hypothesis,
+                    experiment.eval_status,
+                    json.dumps(experiment.metrics),
+                    json.dumps(experiment.artifacts),
+                ),
+            )
+            experiment_id = cur.fetchone()["id"]
+            conn.commit()
+        return experiment_id
+
+    def create_lesson(self, lesson: LessonSpec) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO lessons (
+                    idea_id, experiment_id, lesson_type, summary, reusable_checklist
+                )
+                VALUES (%s::uuid, %s::uuid, %s, %s, %s::jsonb)
+                RETURNING id::text
+                """,
+                (
+                    lesson.idea_id,
+                    lesson.experiment_id,
+                    lesson.lesson_type,
+                    lesson.summary,
+                    json.dumps(lesson.reusable_checklist),
+                ),
+            )
+            lesson_id = cur.fetchone()["id"]
+            conn.commit()
+        return lesson_id
+
+    def insert_strategy_risk_event(self, event: StrategyRiskEvent) -> str:
+        triggered_at = event.triggered_at or datetime.utcnow()
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO strategy_risk_events (
+                    strategy_version_id, event_type, payload, triggered_at
+                )
+                VALUES (%s::uuid, %s, %s::jsonb, %s)
+                RETURNING id::text
+                """,
+                (
+                    event.strategy_version_id,
+                    event.event_type,
+                    json.dumps(event.payload),
+                    triggered_at,
+                ),
+            )
+            risk_event_id = cur.fetchone()["id"]
+            conn.commit()
+        return risk_event_id
+
+    def fetch_strategy_risk_events(self, strategy_version_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    strategy_version_id::text AS strategy_version_id,
+                    event_type,
+                    payload,
+                    triggered_at,
+                    created_at
+                FROM strategy_risk_events
+                WHERE strategy_version_id = %s::uuid
+                ORDER BY triggered_at DESC, created_at DESC
+                LIMIT %s
+                """,
+                (strategy_version_id, max(1, int(limit))),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def upsert_strategy_risk_snapshot(self, snapshot: StrategyRiskSnapshot) -> str:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO strategy_risk_snapshots (
+                    strategy_version_id,
+                    as_of,
+                    as_of_date,
+                    drawdown,
+                    sharpe_20d,
+                    state,
+                    trigger_flags,
+                    cooldown_until
+                )
+                VALUES (
+                    %s::uuid,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s::jsonb,
+                    %s
+                )
+                ON CONFLICT (strategy_version_id, as_of_date)
+                DO UPDATE SET
+                    as_of = EXCLUDED.as_of,
+                    drawdown = EXCLUDED.drawdown,
+                    sharpe_20d = EXCLUDED.sharpe_20d,
+                    state = EXCLUDED.state,
+                    trigger_flags = EXCLUDED.trigger_flags,
+                    cooldown_until = EXCLUDED.cooldown_until
+                RETURNING id::text
+                """,
+                (
+                    snapshot.strategy_version_id,
+                    snapshot.as_of,
+                    snapshot.as_of.date(),
+                    snapshot.drawdown,
+                    snapshot.sharpe_20d,
+                    snapshot.state,
+                    json.dumps(snapshot.trigger_flags),
+                    snapshot.cooldown_until,
+                ),
+            )
+            snapshot_id = cur.fetchone()["id"]
+            conn.commit()
+        return snapshot_id
+
+    def fetch_latest_strategy_risk_snapshot(self, strategy_version_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    strategy_version_id::text AS strategy_version_id,
+                    as_of,
+                    as_of_date,
+                    drawdown,
+                    sharpe_20d,
+                    state,
+                    trigger_flags,
+                    cooldown_until,
+                    created_at
+                FROM strategy_risk_snapshots
+                WHERE strategy_version_id = %s::uuid
+                ORDER BY as_of DESC
+                LIMIT 1
+                """,
+                (strategy_version_id,),
+            )
+            row = cur.fetchone()
+        return row
+
+    def fetch_recent_strategy_risk_snapshots(
+        self,
+        strategy_version_id: str,
+        limit: int = 40,
+    ) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    strategy_version_id::text AS strategy_version_id,
+                    as_of,
+                    as_of_date,
+                    drawdown,
+                    sharpe_20d,
+                    state,
+                    trigger_flags,
+                    cooldown_until,
+                    created_at
+                FROM strategy_risk_snapshots
+                WHERE strategy_version_id = %s::uuid
+                ORDER BY as_of DESC
+                LIMIT %s
+                """,
+                (strategy_version_id, max(1, int(limit))),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def fetch_strategy_symbols_for_portfolio(
+        self,
+        strategy_version_id: str,
+        portfolio_id: str,
+        lookback_days: int = 30,
+    ) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT
+                    COALESCE(tp.value->>'symbol', tp.value->>'security_id') AS symbol,
+                    NULLIF(tp.value->>'instrument_type', '') AS instrument_type
+                FROM order_intents oi
+                CROSS JOIN LATERAL jsonb_array_elements(oi.target_positions) AS tp(value)
+                WHERE oi.strategy_version_id = %s::uuid
+                  AND oi.portfolio_id = %s::uuid
+                  AND oi.created_at >= NOW() - make_interval(days => %s)
+                  AND oi.status IN ('approved', 'executing', 'sent', 'done')
+                  AND COALESCE(tp.value->>'symbol', tp.value->>'security_id') IS NOT NULL
+                """,
+                (
+                    strategy_version_id,
+                    portfolio_id,
+                    max(1, int(lookback_days)),
+                ),
+            )
+            rows = cur.fetchall()
+        return rows
 
     def upsert_portfolio(self, portfolio: PortfolioSpec) -> str:
         with self._conn() as conn, conn.cursor() as cur:
@@ -1417,19 +2524,581 @@ class NeonRepository:
         task_type: str,
         payload: dict[str, Any],
         priority: int = 100,
+        session_id: str | None = None,
+        parent_task_id: str | None = None,
+        assigned_role: str | None = None,
+        dedupe_key: str | None = None,
     ) -> str:
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO agent_tasks (task_type, priority, status, payload)
-                VALUES (%s, %s, 'queued', %s::jsonb)
+                INSERT INTO agent_tasks (
+                    task_type,
+                    priority,
+                    status,
+                    payload,
+                    session_id,
+                    parent_task_id,
+                    assigned_role,
+                    dedupe_key
+                )
+                VALUES (%s, %s, 'queued', %s::jsonb, %s::uuid, %s::uuid, %s, %s)
                 RETURNING id::text
                 """,
-                (task_type, int(priority), json.dumps(payload)),
+                (
+                    task_type,
+                    int(priority),
+                    json.dumps(payload),
+                    session_id,
+                    parent_task_id,
+                    assigned_role,
+                    dedupe_key,
+                ),
             )
             task_id = cur.fetchone()["id"]
             conn.commit()
         return task_id
+
+    def insert_research_external_input(self, spec: ResearchExternalInput) -> str:
+        record_id = str(uuid4())
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO external_inputs (
+                    id,
+                    session_id,
+                    message_id,
+                    source_type,
+                    source_url,
+                    raw_text,
+                    extracted_text,
+                    quality_grade,
+                    extraction_status,
+                    user_comment,
+                    metadata
+                )
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    record_id,
+                    spec.session_id,
+                    spec.message_id,
+                    spec.source_type,
+                    spec.source_url,
+                    spec.raw_text,
+                    spec.extracted_text,
+                    spec.quality_grade,
+                    spec.extraction_status,
+                    spec.user_comment,
+                    json.dumps(spec.metadata or {}),
+                ),
+            )
+            conn.commit()
+        return record_id
+
+    def insert_research_hypothesis(self, spec: ResearchHypothesisSpec) -> str:
+        hypothesis_id = str(uuid4())
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO research_hypotheses (
+                    id,
+                    session_id,
+                    external_input_id,
+                    parent_message_id,
+                    stance,
+                    horizon_days,
+                    thesis_md,
+                    falsification_md,
+                    confidence,
+                    status,
+                    is_favorite,
+                    version,
+                    metadata
+                )
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    hypothesis_id,
+                    spec.session_id,
+                    spec.external_input_id,
+                    spec.parent_message_id,
+                    spec.stance,
+                    int(spec.horizon_days),
+                    spec.thesis_md,
+                    spec.falsification_md,
+                    spec.confidence,
+                    spec.status,
+                    bool(spec.is_favorite),
+                    int(spec.version),
+                    json.dumps(spec.metadata or {}),
+                ),
+            )
+            for asset in spec.assets:
+                cur.execute(
+                    """
+                    INSERT INTO research_hypothesis_assets (
+                        id,
+                        hypothesis_id,
+                        asset_class,
+                        security_id,
+                        symbol_text,
+                        weight_hint,
+                        confidence
+                    )
+                    VALUES (%s::uuid, %s::uuid, %s, %s::uuid, %s, %s, %s)
+                    """,
+                    (
+                        str(uuid4()),
+                        hypothesis_id,
+                        asset.asset_class,
+                        asset.security_id,
+                        asset.symbol_text,
+                        asset.weight_hint,
+                        asset.confidence,
+                    ),
+                )
+            conn.commit()
+        return hypothesis_id
+
+    def insert_research_artifact(self, spec: ResearchArtifactSpec) -> str:
+        artifact_id = str(uuid4())
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO research_artifacts (
+                    id,
+                    session_id,
+                    hypothesis_id,
+                    artifact_type,
+                    title,
+                    body_md,
+                    code_text,
+                    language,
+                    is_favorite,
+                    created_by_task_id,
+                    metadata
+                )
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s::uuid, %s::jsonb)
+                """,
+                (
+                    artifact_id,
+                    spec.session_id,
+                    spec.hypothesis_id,
+                    spec.artifact_type,
+                    spec.title,
+                    spec.body_md,
+                    spec.code_text,
+                    spec.language,
+                    bool(spec.is_favorite),
+                    spec.created_by_task_id,
+                    json.dumps(spec.metadata or {}),
+                ),
+            )
+            conn.commit()
+        return artifact_id
+
+    def insert_research_artifact_run(self, spec: ResearchArtifactRunSpec) -> str:
+        run_id = str(uuid4())
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO research_artifact_runs (
+                    id,
+                    artifact_id,
+                    run_status,
+                    stdout_text,
+                    stderr_text,
+                    result_json,
+                    output_r2_key
+                )
+                VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s::jsonb, %s)
+                """,
+                (
+                    run_id,
+                    spec.artifact_id,
+                    spec.run_status,
+                    spec.stdout_text,
+                    spec.stderr_text,
+                    json.dumps(spec.result_json or {}),
+                    spec.output_r2_key,
+                ),
+            )
+            conn.commit()
+        return run_id
+
+    def insert_research_hypothesis_outcome(self, spec: ResearchHypothesisOutcomeSpec) -> str:
+        outcome_id = str(uuid4())
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO research_hypothesis_outcomes (
+                    id,
+                    hypothesis_id,
+                    checked_at,
+                    ret_1d,
+                    ret_5d,
+                    ret_20d,
+                    mfe,
+                    mae,
+                    outcome_label,
+                    summary_md,
+                    metadata
+                )
+                VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    outcome_id,
+                    spec.hypothesis_id,
+                    spec.checked_at,
+                    spec.ret_1d,
+                    spec.ret_5d,
+                    spec.ret_20d,
+                    spec.mfe,
+                    spec.mae,
+                    spec.outcome_label,
+                    spec.summary_md,
+                    json.dumps(spec.metadata or {}),
+                ),
+            )
+            conn.commit()
+        return outcome_id
+
+    def append_chat_message(
+        self,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        run_id: str | None = None,
+        answer_before: str | None = None,
+        answer_after: str | None = None,
+        change_reason: str | None = None,
+    ) -> str:
+        message_id = str(uuid4())
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO chat_messages (
+                    id,
+                    session_id,
+                    run_id,
+                    role,
+                    content,
+                    answer_before,
+                    answer_after,
+                    change_reason
+                )
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message_id,
+                    session_id,
+                    run_id,
+                    role,
+                    content,
+                    answer_before,
+                    answer_after,
+                    change_reason,
+                ),
+            )
+            conn.commit()
+        return message_id
+
+    def fetch_latest_chat_message(self, session_id: str, role: str | None = None) -> dict[str, Any] | None:
+        with self._conn() as conn, conn.cursor() as cur:
+            if role:
+                cur.execute(
+                    """
+                    SELECT
+                        id::text AS id,
+                        session_id::text AS session_id,
+                        role,
+                        content,
+                        answer_before,
+                        answer_after,
+                        change_reason,
+                        created_at
+                    FROM chat_messages
+                    WHERE session_id = %s::uuid
+                      AND role = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (session_id, role),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        id::text AS id,
+                        session_id::text AS session_id,
+                        role,
+                        content,
+                        answer_before,
+                        answer_after,
+                        change_reason,
+                        created_at
+                    FROM chat_messages
+                    WHERE session_id = %s::uuid
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                )
+            return cur.fetchone()
+
+    def fetch_research_external_inputs(self, session_id: str) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    session_id::text AS session_id,
+                    message_id::text AS message_id,
+                    source_type,
+                    source_url,
+                    raw_text,
+                    extracted_text,
+                    quality_grade,
+                    extraction_status,
+                    user_comment,
+                    metadata,
+                    created_at
+                FROM external_inputs
+                WHERE session_id = %s::uuid
+                ORDER BY created_at ASC
+                """,
+                (session_id,),
+            )
+            return cur.fetchall()
+
+    def update_research_external_input(
+        self,
+        input_id: str,
+        *,
+        extracted_text: str | None = None,
+        quality_grade: str | None = None,
+        extraction_status: str | None = None,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE external_inputs
+                SET extracted_text = COALESCE(%s, extracted_text),
+                    quality_grade = COALESCE(%s, quality_grade),
+                    extraction_status = COALESCE(%s, extraction_status),
+                    metadata = CASE
+                        WHEN %s::jsonb IS NULL THEN metadata
+                        ELSE metadata || %s::jsonb
+                    END
+                WHERE id = %s::uuid
+                """,
+                (
+                    extracted_text,
+                    quality_grade,
+                    extraction_status,
+                    json.dumps(metadata_patch) if metadata_patch is not None else None,
+                    json.dumps(metadata_patch) if metadata_patch is not None else None,
+                    input_id,
+                ),
+            )
+            conn.commit()
+
+    def fetch_research_hypotheses_by_ids(self, hypothesis_ids: list[str]) -> list[dict[str, Any]]:
+        cleaned = [item for item in hypothesis_ids if item]
+        if not cleaned:
+            return []
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    h.id::text AS id,
+                    h.session_id::text AS session_id,
+                    h.external_input_id::text AS external_input_id,
+                    h.parent_message_id::text AS parent_message_id,
+                    h.stance,
+                    h.horizon_days,
+                    h.thesis_md,
+                    h.falsification_md,
+                    h.confidence,
+                    h.status,
+                    h.is_favorite,
+                    h.version,
+                    h.metadata,
+                    h.created_at
+                FROM research_hypotheses h
+                WHERE h.id = ANY(%s::uuid[])
+                ORDER BY h.created_at ASC
+                """,
+                (cleaned,),
+            )
+            return cur.fetchall()
+
+    def fetch_research_hypotheses_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    h.id::text AS id,
+                    h.session_id::text AS session_id,
+                    h.external_input_id::text AS external_input_id,
+                    h.parent_message_id::text AS parent_message_id,
+                    h.stance,
+                    h.horizon_days,
+                    h.thesis_md,
+                    h.falsification_md,
+                    h.confidence,
+                    h.status,
+                    h.is_favorite,
+                    h.version,
+                    h.metadata,
+                    h.created_at
+                FROM research_hypotheses h
+                WHERE h.session_id = %s::uuid
+                ORDER BY h.created_at ASC
+                """,
+                (session_id,),
+            )
+            return cur.fetchall()
+
+    def fetch_research_hypothesis_assets(self, hypothesis_ids: list[str]) -> list[dict[str, Any]]:
+        cleaned = [item for item in hypothesis_ids if item]
+        if not cleaned:
+            return []
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    a.id::text AS id,
+                    a.hypothesis_id::text AS hypothesis_id,
+                    a.asset_class,
+                    a.symbol_text,
+                    a.weight_hint,
+                    a.confidence,
+                    s.security_id,
+                    s.ticker,
+                    s.name,
+                    s.market
+                FROM research_hypothesis_assets a
+                LEFT JOIN securities s
+                  ON s.id = a.security_id
+                WHERE a.hypothesis_id = ANY(%s::uuid[])
+                ORDER BY a.created_at ASC
+                """,
+                (cleaned,),
+            )
+            return cur.fetchall()
+
+    def update_research_hypothesis(
+        self,
+        hypothesis_id: str,
+        *,
+        status: str | None = None,
+        thesis_md: str | None = None,
+        falsification_md: str | None = None,
+        confidence: float | None = None,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE research_hypotheses
+                SET status = COALESCE(%s, status),
+                    thesis_md = COALESCE(%s, thesis_md),
+                    falsification_md = COALESCE(%s, falsification_md),
+                    confidence = COALESCE(%s, confidence),
+                    metadata = CASE
+                        WHEN %s::jsonb IS NULL THEN metadata
+                        ELSE metadata || %s::jsonb
+                    END
+                WHERE id = %s::uuid
+                """,
+                (
+                    status,
+                    thesis_md,
+                    falsification_md,
+                    confidence,
+                    json.dumps(metadata_patch) if metadata_patch is not None else None,
+                    json.dumps(metadata_patch) if metadata_patch is not None else None,
+                    hypothesis_id,
+                ),
+            )
+            conn.commit()
+
+    def fetch_research_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    session_id::text AS session_id,
+                    hypothesis_id::text AS hypothesis_id,
+                    artifact_type,
+                    title,
+                    body_md,
+                    code_text,
+                    language,
+                    is_favorite,
+                    created_by_task_id::text AS created_by_task_id,
+                    metadata,
+                    created_at
+                FROM research_artifacts
+                WHERE id = %s::uuid
+                LIMIT 1
+                """,
+                (artifact_id,),
+            )
+            return cur.fetchone()
+
+    def fetch_research_artifacts_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    session_id::text AS session_id,
+                    hypothesis_id::text AS hypothesis_id,
+                    artifact_type,
+                    title,
+                    body_md,
+                    code_text,
+                    language,
+                    is_favorite,
+                    created_by_task_id::text AS created_by_task_id,
+                    metadata,
+                    created_at
+                FROM research_artifacts
+                WHERE session_id = %s::uuid
+                ORDER BY created_at ASC
+                """,
+                (session_id,),
+            )
+            return cur.fetchall()
+
+    def fetch_latest_research_artifact_run(self, artifact_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    artifact_id::text AS artifact_id,
+                    run_status,
+                    stdout_text,
+                    stderr_text,
+                    result_json,
+                    output_r2_key,
+                    metadata,
+                    created_at
+                FROM research_artifact_runs
+                WHERE artifact_id = %s::uuid
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (artifact_id,),
+            )
+            return cur.fetchone()
 
     def mark_agent_task(
         self,
@@ -1437,6 +3106,7 @@ class NeonRepository:
         status: str,
         result: dict[str, Any] | None = None,
         cost_usd: float | None = None,
+        error_text: str | None = None,
     ) -> None:
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
@@ -1445,6 +3115,8 @@ class NeonRepository:
                 SET status = %s,
                     result = COALESCE(%s::jsonb, result),
                     cost_usd = COALESCE(%s, cost_usd),
+                    error_text = COALESCE(%s, error_text),
+                    attempt_count = CASE WHEN %s = 'failed' THEN attempt_count + 1 ELSE attempt_count END,
                     started_at = CASE WHEN status = 'queued' AND %s = 'running' THEN NOW() ELSE started_at END,
                     finished_at = CASE WHEN %s IN ('success', 'failed', 'canceled') THEN NOW() ELSE finished_at END
                 WHERE id = %s::uuid
@@ -1453,6 +3125,8 @@ class NeonRepository:
                     status,
                     json.dumps(result) if result is not None else None,
                     cost_usd,
+                    error_text,
+                    status,
                     status,
                     status,
                     task_id,
@@ -1488,6 +3162,28 @@ class NeonRepository:
             rows = cur.fetchall()
         return rows
 
+    def has_recent_open_intent_for_strategy(
+        self,
+        strategy_version_id: str,
+        lookback_minutes: int = 180,
+    ) -> bool:
+        lookback = max(1, int(lookback_minutes))
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM order_intents oi
+                    WHERE oi.strategy_version_id = %s::uuid
+                      AND oi.status IN ('proposed', 'approved', 'sent', 'executing')
+                      AND oi.created_at >= NOW() - make_interval(mins => %s)
+                ) AS exists_flag
+                """,
+                (strategy_version_id, lookback),
+            )
+            row = cur.fetchone()
+        return bool((row or {}).get("exists_flag", False))
+
     def update_order_intent_status(self, intent_id: str, status: str) -> None:
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
@@ -1499,6 +3195,80 @@ class NeonRepository:
                 (status, intent_id),
             )
             conn.commit()
+
+    def fetch_positions_for_portfolio(
+        self,
+        portfolio_id: str,
+        symbols: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        symbol_filter = [str(symbol).strip() for symbol in (symbols or []) if str(symbol).strip()]
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    symbol,
+                    instrument_type,
+                    qty,
+                    avg_price,
+                    last_price,
+                    market_value,
+                    unrealized_pnl,
+                    realized_pnl,
+                    updated_at
+                FROM positions
+                WHERE portfolio_id = %s::uuid
+                  AND (%s::text[] IS NULL OR symbol = ANY(%s))
+                ORDER BY symbol, instrument_type
+                """,
+                (
+                    portfolio_id,
+                    symbol_filter if symbol_filter else None,
+                    symbol_filter if symbol_filter else None,
+                ),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def fetch_open_orders_for_portfolio(
+        self,
+        portfolio_id: str,
+        symbols: list[str] | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        symbol_filter = [str(symbol).strip() for symbol in (symbols or []) if str(symbol).strip()]
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    o.id::text AS order_id,
+                    o.intent_id::text AS intent_id,
+                    o.broker,
+                    o.symbol,
+                    o.instrument_type,
+                    o.side,
+                    o.qty,
+                    o.status,
+                    o.submitted_at,
+                    o.updated_at,
+                    o.meta
+                FROM orders o
+                JOIN order_intents oi
+                  ON oi.id = o.intent_id
+                WHERE oi.portfolio_id = %s::uuid
+                  AND o.status IN ('new', 'sent', 'ack', 'partially_filled')
+                  AND (%s::text[] IS NULL OR o.symbol = ANY(%s))
+                ORDER BY o.updated_at DESC
+                LIMIT %s
+                """,
+                (
+                    portfolio_id,
+                    symbol_filter if symbol_filter else None,
+                    symbol_filter if symbol_filter else None,
+                    max(1, int(limit)),
+                ),
+            )
+            rows = cur.fetchall()
+        return rows
 
     def fetch_latest_risk_snapshot(self, portfolio_id: str) -> dict[str, Any] | None:
         with self._conn() as conn, conn.cursor() as cur:
@@ -1572,6 +3342,48 @@ class NeonRepository:
             )
             row = cur.fetchone()
         return row
+
+    def fetch_price_history_for_security(
+        self,
+        security_id: str,
+        start_date: date,
+        end_date: date,
+    ) -> pd.DataFrame:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.security_id,
+                    s.market,
+                    p.trade_date,
+                    p.open_raw,
+                    p.high_raw,
+                    p.low_raw,
+                    p.close_raw
+                FROM prices_daily p
+                JOIN securities s
+                  ON s.id = p.security_id
+                WHERE s.security_id = %s
+                  AND p.trade_date BETWEEN %s AND %s
+                ORDER BY p.trade_date
+                """,
+                (security_id, start_date, end_date),
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "security_id",
+                    "market",
+                    "trade_date",
+                    "open_raw",
+                    "high_raw",
+                    "low_raw",
+                    "close_raw",
+                ]
+            )
+        return pd.DataFrame(rows)
 
     def fetch_latest_fundamental_ratings_by_symbols(self, symbols: list[str]) -> dict[str, str]:
         cleaned = [str(symbol).strip() for symbol in symbols if str(symbol).strip()]
@@ -1683,27 +3495,230 @@ class NeonRepository:
             rows = cur.fetchall()
         return rows
 
-    def fetch_queued_agent_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+    def fetch_latest_strategy_edge_inputs(
+        self,
+        asset_scope: str,
+        statuses: list[str] | None = None,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        status_values = statuses or ["candidate", "approved", "paper", "live"]
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH latest_versions AS (
+                    SELECT DISTINCT ON (sv.strategy_id)
+                        sv.strategy_id,
+                        sv.id::text AS strategy_version_id,
+                        sv.version,
+                        sv.spec AS strategy_spec
+                    FROM strategy_versions sv
+                    ORDER BY sv.strategy_id, sv.version DESC
+                ),
+                latest_eval AS (
+                    SELECT DISTINCT ON (se.strategy_version_id)
+                        se.strategy_version_id,
+                        se.eval_type,
+                        nullif(se.metrics->>'sharpe', '')::double precision AS sharpe,
+                        nullif(se.metrics->>'max_dd', '')::double precision AS max_dd,
+                        nullif(se.metrics->>'cagr', '')::double precision AS cagr,
+                        se.metrics AS metrics,
+                        se.artifacts AS artifacts,
+                        se.created_at
+                    FROM strategy_evaluations se
+                    ORDER BY se.strategy_version_id, se.created_at DESC
+                )
+                SELECT
+                    s.id::text AS strategy_id,
+                    s.name AS strategy_name,
+                    s.asset_scope,
+                    s.status,
+                    lv.strategy_version_id,
+                    lv.version,
+                    lv.strategy_spec,
+                    le.eval_type,
+                    le.sharpe,
+                    le.max_dd,
+                    le.cagr,
+                    le.metrics,
+                    le.artifacts,
+                    le.created_at AS eval_created_at
+                FROM strategies s
+                JOIN latest_versions lv
+                  ON lv.strategy_id = s.id
+                LEFT JOIN latest_eval le
+                  ON le.strategy_version_id = lv.strategy_version_id::uuid
+                WHERE s.asset_scope = %s
+                  AND s.status = ANY(%s)
+                ORDER BY s.updated_at DESC
+                LIMIT %s
+                """,
+                (asset_scope, status_values, max(1, int(limit))),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def fetch_latest_edge_states(
+        self,
+        market_scope: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT
                     id::text AS id,
+                    strategy_name,
+                    strategy_version_id::text AS strategy_version_id,
+                    market_scope,
+                    symbol,
+                    observed_at,
+                    edge_score,
+                    COALESCE(expected_net_edge, expected_net_edge_bps) AS expected_net_edge,
+                    COALESCE(distance_to_entry, distance_to_entry_bps) AS distance_to_entry,
+                    expected_net_edge_bps,
+                    distance_to_entry_bps,
+                    confidence,
+                    COALESCE(NULLIF(risk_json, '{}'::jsonb), risk, '{}'::jsonb) AS risk_json,
+                    risk,
+                    explain,
+                    COALESCE(market_regime, market_scope) AS market_regime,
+                    meta,
+                    created_at
+                FROM edge_states
+                WHERE (%s::text IS NULL OR market_scope = %s)
+                ORDER BY observed_at DESC, edge_score DESC
+                LIMIT %s
+                """,
+                (market_scope, market_scope, max(1, int(limit))),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def fetch_latest_edge_state_for_strategy(
+        self,
+        strategy_version_id: str,
+        at_or_before: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    strategy_name,
+                    strategy_version_id::text AS strategy_version_id,
+                    market_scope,
+                    symbol,
+                    observed_at,
+                    edge_score,
+                    COALESCE(expected_net_edge, expected_net_edge_bps) AS expected_net_edge,
+                    COALESCE(distance_to_entry, distance_to_entry_bps) AS distance_to_entry,
+                    expected_net_edge_bps,
+                    distance_to_entry_bps,
+                    confidence,
+                    COALESCE(NULLIF(risk_json, '{}'::jsonb), risk, '{}'::jsonb) AS risk_json,
+                    risk,
+                    explain,
+                    COALESCE(market_regime, market_scope) AS market_regime,
+                    meta,
+                    created_at
+                FROM edge_states
+                WHERE strategy_version_id = %s::uuid
+                  AND (%s::timestamptz IS NULL OR observed_at <= %s)
+                ORDER BY observed_at DESC, edge_score DESC
+                LIMIT 1
+                """,
+                (strategy_version_id, at_or_before, at_or_before),
+            )
+            row = cur.fetchone()
+        return row
+
+    def fetch_edge_states_for_period(
+        self,
+        strategy_version_id: str,
+        start_at: datetime,
+        end_at: datetime,
+        limit: int = 2000,
+    ) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    strategy_name,
+                    strategy_version_id::text AS strategy_version_id,
+                    market_scope,
+                    symbol,
+                    observed_at,
+                    edge_score,
+                    COALESCE(expected_net_edge, expected_net_edge_bps) AS expected_net_edge,
+                    COALESCE(distance_to_entry, distance_to_entry_bps) AS distance_to_entry,
+                    expected_net_edge_bps,
+                    distance_to_entry_bps,
+                    confidence,
+                    COALESCE(NULLIF(risk_json, '{}'::jsonb), risk, '{}'::jsonb) AS risk_json,
+                    risk,
+                    explain,
+                    COALESCE(market_regime, market_scope) AS market_regime,
+                    meta,
+                    created_at
+                FROM edge_states
+                WHERE strategy_version_id = %s::uuid
+                  AND observed_at >= %s
+                  AND observed_at <= %s
+                ORDER BY observed_at ASC, edge_score DESC
+                LIMIT %s
+                """,
+                (strategy_version_id, start_at, end_at, max(1, int(limit))),
+            )
+            rows = cur.fetchall()
+        return rows
+
+    def fetch_queued_agent_tasks(
+        self,
+        limit: int = 20,
+        task_types: list[str] | None = None,
+        assigned_role: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS id,
+                    session_id::text AS session_id,
+                    parent_task_id::text AS parent_task_id,
                     task_type,
                     priority,
                     status,
                     payload,
                     result,
                     cost_usd,
+                    attempt_count,
+                    max_attempts,
+                    available_at,
+                    lease_owner,
+                    lease_expires_at,
+                    dedupe_key,
+                    error_text,
+                    assigned_role,
+                    assigned_node,
                     started_at,
                     finished_at,
                     created_at
                 FROM agent_tasks
                 WHERE status = 'queued'
+                  AND available_at <= NOW()
+                  AND (%s::text[] IS NULL OR task_type = ANY(%s))
+                  AND (%s::text IS NULL OR assigned_role = %s OR assigned_role IS NULL)
                 ORDER BY priority ASC, created_at ASC
                 LIMIT %s
                 """,
-                (max(1, int(limit)),),
+                (
+                    task_types,
+                    task_types,
+                    assigned_role,
+                    assigned_role,
+                    max(1, int(limit)),
+                ),
             )
             rows = cur.fetchall()
         return rows

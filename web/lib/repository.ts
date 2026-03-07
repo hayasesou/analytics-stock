@@ -2,14 +2,31 @@ import { randomUUID } from "node:crypto";
 
 import { getSql } from "@/lib/db";
 import type {
+  BacktestData,
+  BacktestMeta,
   BacktestMetric,
   BacktestPoint,
+  BacktestReasonCode,
+  BacktestRunOption,
   CitationRecord,
+  EdgeStateRow,
+  EdgeTrendPoint,
   ExecutionOrderIntent,
   ExecutionRiskSnapshot,
   EventRecord,
   ResearchAgentTask,
+  ResearchArtifactRecord,
+  ResearchArtifactRunStatus,
   ResearchFundamentalSnapshot,
+  ResearchHypothesisOutcomeRecord,
+  ResearchHypothesisRecord,
+  ResearchInputRecord,
+  ResearchKanbanLane,
+  ResearchKanbanStatus,
+  ResearchLifecycleReview,
+  ResearchChatSessionDetail,
+  ResearchChatMessageRecord,
+  ResearchSessionListItem,
   ResearchStrategy,
   ReportRecord,
   SecurityIdentity,
@@ -37,6 +54,10 @@ function decodeSecurityId(raw: string): string {
   }
 }
 
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 function clampLookbackDays(days: number): number {
   if (!Number.isFinite(days)) {
     return 180;
@@ -56,6 +77,20 @@ function clampExecutionLimit(limit: number): number {
     return 50;
   }
   return Math.min(200, Math.max(1, Math.trunc(limit)));
+}
+
+function clampBacktestRunLimit(limit: number): number {
+  if (!Number.isFinite(limit)) {
+    return 20;
+  }
+  return Math.min(200, Math.max(20, Math.trunc(limit)));
+}
+
+function clampEdgeLimit(limit: number): number {
+  if (!Number.isFinite(limit)) {
+    return 120;
+  }
+  return Math.min(500, Math.max(1, Math.trunc(limit)));
 }
 
 function mapSecurityIdentityRow(row: {
@@ -78,6 +113,154 @@ function isLegacyMockSecurity(row: { market: "JP" | "US"; name: string }): boole
     return /^JP Corp \d{4}$/.test(name);
   }
   return /^US Holdings \d+$/.test(name);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function asNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
+function asBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function extractFoldValidationSummary(
+  metricsValue: unknown,
+  artifactsValue: unknown
+): Pick<
+  ResearchStrategy,
+  | "validationPassed"
+  | "validationFoldCount"
+  | "validationPrimaryProfile"
+  | "foldSharpeFirst"
+  | "foldSharpeLast"
+  | "foldSharpeDelta"
+  | "foldSharpeMin"
+  | "foldSharpeMax"
+  | "validationFailReasons"
+  | "validationFolds"
+  | "validationGates"
+> {
+  const metrics = asRecord(metricsValue);
+  const artifacts = asRecord(artifactsValue);
+  const validation = asRecord(artifacts?.validation);
+  const gate = asRecord(validation?.gate);
+  const summary = asRecord(validation?.summary);
+  const policy = asRecord(validation?.policy);
+  const gates = asRecord(policy?.gates);
+
+  const primaryProfile =
+    asString(metrics?.validation_primary_profile)
+    ?? asString(gate?.primary_cost_profile)
+    ?? "standard";
+
+  const primarySummary = summary ? asRecord(summary[primaryProfile]) : null;
+  const profileFoldCount = asNumber(primarySummary?.fold_count);
+  const foldCountFromMetrics = asNumber(metrics?.validation_fold_count);
+
+  const foldsRaw = Array.isArray(validation?.folds) ? validation.folds : [];
+  const normalizedFolds: ResearchStrategy["validationFolds"] = [];
+  const sharpeSeries: number[] = [];
+
+  for (const foldRaw of foldsRaw) {
+    const fold = asRecord(foldRaw);
+    if (!fold) {
+      continue;
+    }
+    const profiles = asRecord(fold.profiles);
+    const normalizedProfiles: Record<string, { sharpe: number | null; cagr: number | null; maxDd: number | null; tradeCount: number | null }> = {};
+    if (profiles) {
+      for (const [profileName, rawProfileMetrics] of Object.entries(profiles)) {
+        const profileMetrics = asRecord(rawProfileMetrics);
+        if (!profileMetrics) {
+          continue;
+        }
+        normalizedProfiles[profileName] = {
+          sharpe: asNumber(profileMetrics.sharpe),
+          cagr: asNumber(profileMetrics.cagr),
+          maxDd: asNumber(profileMetrics.max_dd),
+          tradeCount: asNumber(profileMetrics.trade_count)
+        };
+      }
+    }
+
+    const skipped = asBoolean(fold.skipped) ?? false;
+    const primarySharpe = normalizedProfiles[primaryProfile]?.sharpe ?? null;
+    if (!skipped && primarySharpe != null) {
+      sharpeSeries.push(primarySharpe);
+    }
+
+    normalizedFolds.push({
+      fold: asNumber(fold.fold) ?? normalizedFolds.length,
+      trainStart: asString(fold.train_start) ?? "",
+      trainEnd: asString(fold.train_end) ?? "",
+      testStart: asString(fold.test_start) ?? "",
+      testEnd: asString(fold.test_end) ?? "",
+      signalCount: asNumber(fold.signal_count) ?? 0,
+      momentumThreshold: asNumber(fold.momentum_threshold),
+      skipped,
+      skipReason: asString(fold.skip_reason),
+      profiles: normalizedProfiles
+    });
+  }
+
+  const foldSharpeFirst = sharpeSeries.length > 0 ? sharpeSeries[0] : null;
+  const foldSharpeLast = sharpeSeries.length > 0 ? sharpeSeries[sharpeSeries.length - 1] : null;
+  const foldSharpeMin = sharpeSeries.length > 0 ? Math.min(...sharpeSeries) : null;
+  const foldSharpeMax = sharpeSeries.length > 0 ? Math.max(...sharpeSeries) : null;
+  const foldSharpeDelta = (foldSharpeFirst != null && foldSharpeLast != null)
+    ? foldSharpeLast - foldSharpeFirst
+    : null;
+
+  const failReasons = asStringArray(metrics?.validation_fail_reasons);
+  const gateReasons = asStringArray(gate?.reasons);
+  const validationGates = gates
+    ? {
+        minFoldCount: asNumber(gates.min_fold_count),
+        minTradesPerFold: asNumber(gates.min_trades_per_fold),
+        minSharpe: asNumber(gates.min_sharpe),
+        minCagr: asNumber(gates.min_cagr),
+        minMaxDd: asNumber(gates.min_max_dd)
+      }
+    : null;
+
+  return {
+    validationPassed: asBoolean(metrics?.validation_passed) ?? asBoolean(gate?.passed),
+    validationFoldCount: foldCountFromMetrics ?? profileFoldCount ?? (sharpeSeries.length || null),
+    validationPrimaryProfile: primaryProfile,
+    foldSharpeFirst,
+    foldSharpeLast,
+    foldSharpeDelta,
+    foldSharpeMin,
+    foldSharpeMax,
+    validationFailReasons: failReasons.length > 0 ? failReasons : gateReasons,
+    validationFolds: normalizedFolds,
+    validationGates
+  };
 }
 
 export async function latestRunId(runType: "weekly" | "daily"): Promise<string | null> {
@@ -827,25 +1010,161 @@ export async function fetchLatestDailyEvents(limit = 10): Promise<EventRecord[]>
   }));
 }
 
-export async function fetchBacktestData(): Promise<{
-  metrics: BacktestMetric[];
-  curve: BacktestPoint[];
-}> {
+export async function fetchBacktestData(input?: {
+  runId?: string | null;
+  fallbackMode?: "none" | "latest_with_backtest";
+}): Promise<BacktestData> {
   const sql = getSql();
-  const runId = await latestRunId("weekly");
-  if (!runId) {
-    return { metrics: [], curve: [] };
+  const requestedRunIdRaw = input?.runId?.trim() || null;
+  const requestedRunId = requestedRunIdRaw && isUuid(requestedRunIdRaw) ? requestedRunIdRaw : null;
+  const fallbackMode = input?.fallbackMode === "latest_with_backtest" ? "latest_with_backtest" : "none";
+
+  type RunMetaRow = {
+    run_id: string;
+    status: string;
+    started_at: string;
+    finished_at: string | null;
+    signals: number | null;
+    backtest_profiles: number | null;
+  };
+  type LatestWithBacktestRow = RunMetaRow & {
+    backtest_run_id: string;
+  };
+
+  const latestWeeklyRunId = await latestRunId("weekly");
+  const latestWithBacktestRows = await sql<LatestWithBacktestRow[]>`
+    select
+      r.id::text as run_id,
+      br.id::text as backtest_run_id,
+      r.status,
+      r.started_at::text as started_at,
+      r.finished_at::text as finished_at,
+      nullif(r.metadata->>'signals', '')::int as signals,
+      nullif(r.metadata->>'backtest_profiles', '')::int as backtest_profiles
+    from backtest_runs br
+    join runs r on r.id = br.run_id
+    where r.run_type = 'weekly'
+      and r.status = 'success'
+    order by coalesce(r.finished_at, r.started_at) desc, br.created_at desc
+    limit 1
+  `;
+  const latestWithBacktest = latestWithBacktestRows[0] ?? null;
+  const latestWithBacktestRunId = latestWithBacktest?.run_id ?? null;
+
+  const buildMeta = (
+    partial?: Partial<BacktestMeta>
+  ): BacktestMeta => ({
+    requestedRunId: requestedRunIdRaw,
+    resolvedRunId: null,
+    latestWeeklyRunId,
+    latestWithBacktestRunId,
+    resolvedSource: "none",
+    reasonCode: "no_weekly_run",
+    resolvedRunStatus: null,
+    resolvedRunStartedAt: null,
+    resolvedRunFinishedAt: null,
+    resolvedRunSignals: null,
+    resolvedRunBacktestProfiles: null,
+    ...partial
+  });
+
+  const emptyResponse = (meta: BacktestMeta): BacktestData => ({
+    metrics: [],
+    curve: [],
+    meta
+  });
+
+  const runMetaById = async (runId: string): Promise<RunMetaRow | null> => {
+    const rows = await sql<RunMetaRow[]>`
+      select
+        r.id::text as run_id,
+        r.status,
+        r.started_at::text as started_at,
+        r.finished_at::text as finished_at,
+        nullif(r.metadata->>'signals', '')::int as signals,
+        nullif(r.metadata->>'backtest_profiles', '')::int as backtest_profiles
+      from runs r
+      where r.id = ${runId}::uuid
+        and r.run_type = 'weekly'
+      limit 1
+    `;
+    return rows[0] ?? null;
+  };
+
+  const latestWeeklyMeta = latestWeeklyRunId ? await runMetaById(latestWeeklyRunId) : null;
+  if (!latestWeeklyMeta && !requestedRunId) {
+    return emptyResponse(buildMeta({ reasonCode: "no_weekly_run" }));
   }
 
-  const backtest = await sql<{ id: string }[]>`
+  let targetRun: RunMetaRow | null = null;
+  let resolvedSource: BacktestMeta["resolvedSource"] = "none";
+  let fallbackReason: BacktestReasonCode | null = null;
+
+  if (requestedRunIdRaw && !requestedRunId) {
+    if (fallbackMode === "latest_with_backtest" && latestWithBacktest) {
+      targetRun = latestWithBacktest;
+      resolvedSource = "latest_with_backtest";
+      fallbackReason = "requested_run_not_found";
+    } else {
+      return emptyResponse(buildMeta({ reasonCode: "requested_run_not_found" }));
+    }
+  } else if (requestedRunId) {
+    const requestedMeta = await runMetaById(requestedRunId);
+    if (!requestedMeta) {
+      if (fallbackMode === "latest_with_backtest" && latestWithBacktest) {
+        targetRun = latestWithBacktest;
+        resolvedSource = "latest_with_backtest";
+        fallbackReason = "requested_run_not_found";
+      } else {
+        return emptyResponse(buildMeta({ reasonCode: "requested_run_not_found" }));
+      }
+    } else {
+      targetRun = requestedMeta;
+      resolvedSource = "requested";
+    }
+  } else {
+    targetRun = latestWeeklyMeta;
+    resolvedSource = "latest_weekly";
+  }
+
+  if (!targetRun) {
+    return emptyResponse(buildMeta({ reasonCode: "no_weekly_run" }));
+  }
+
+  const backtestRows = await sql<{ id: string }[]>`
     select id::text as id
     from backtest_runs
-    where run_id = ${runId}::uuid
+    where run_id = ${targetRun.run_id}::uuid
     order by created_at desc
     limit 1
   `;
-  if (!backtest[0]) {
-    return { metrics: [], curve: [] };
+  let resolvedBacktestRunId = backtestRows[0]?.id ?? null;
+  if (!resolvedBacktestRunId && fallbackMode === "latest_with_backtest" && latestWithBacktest) {
+    const latestHasDifferentRun = latestWithBacktest.run_id !== targetRun.run_id;
+    if (latestHasDifferentRun) {
+      fallbackReason = requestedRunId ? "requested_run_has_no_backtest" : "latest_weekly_has_no_backtest";
+      targetRun = latestWithBacktest;
+      resolvedSource = "latest_with_backtest";
+      resolvedBacktestRunId = latestWithBacktest.backtest_run_id;
+    }
+  }
+
+  if (!resolvedBacktestRunId) {
+    const reason: BacktestReasonCode = requestedRunId
+      ? "requested_run_has_no_backtest"
+      : "latest_weekly_has_no_backtest";
+    return emptyResponse(
+      buildMeta({
+        resolvedRunId: targetRun.run_id,
+        resolvedSource,
+        reasonCode: reason,
+        resolvedRunStatus: targetRun.status,
+        resolvedRunStartedAt: targetRun.started_at,
+        resolvedRunFinishedAt: targetRun.finished_at,
+        resolvedRunSignals: targetRun.signals,
+        resolvedRunBacktestProfiles: targetRun.backtest_profiles
+      })
+    );
   }
 
   const metricsRows = await sql<
@@ -876,7 +1195,7 @@ export async function fetchBacktestData(): Promise<{
       alpha_simple,
       information_ratio_simple
     from backtest_metrics
-    where backtest_run_id = ${backtest[0].id}::uuid and market_scope = 'MIXED'
+    where backtest_run_id = ${resolvedBacktestRunId}::uuid and market_scope = 'MIXED'
     order by cost_profile asc
   `;
 
@@ -894,9 +1213,15 @@ export async function fetchBacktestData(): Promise<{
       equity,
       benchmark_equity
     from backtest_equity_curve
-    where backtest_run_id = ${backtest[0].id}::uuid
+    where backtest_run_id = ${resolvedBacktestRunId}::uuid
     order by trade_date asc
   `;
+  const tradeCountRows = await sql<{ trade_count: number }[]>`
+    select count(*)::int as trade_count
+    from backtest_trades
+    where backtest_run_id = ${resolvedBacktestRunId}::uuid
+  `;
+  const tradeCount = Number(tradeCountRows[0]?.trade_count ?? 0);
 
   const rawCurve = curveRows.map((r) => ({
     costProfile: r.cost_profile,
@@ -917,6 +1242,15 @@ export async function fetchBacktestData(): Promise<{
     };
   });
 
+  let reasonCode: BacktestReasonCode = fallbackReason ?? "ok";
+  if (metricsRows.length === 0) {
+    reasonCode = "no_metrics";
+  } else if (curve.length === 0) {
+    reasonCode = "no_curve";
+  } else if (tradeCount === 0) {
+    reasonCode = "no_signals";
+  }
+
   return {
     metrics: metricsRows.map((r) => ({
       costProfile: r.cost_profile,
@@ -931,8 +1265,66 @@ export async function fetchBacktestData(): Promise<{
       alphaSimple: Number(r.alpha_simple ?? 0),
       informationRatioSimple: Number(r.information_ratio_simple ?? 0)
     })),
-    curve
+    curve,
+    meta: buildMeta({
+      resolvedRunId: targetRun.run_id,
+      resolvedSource,
+      reasonCode,
+      resolvedRunStatus: targetRun.status,
+      resolvedRunStartedAt: targetRun.started_at,
+      resolvedRunFinishedAt: targetRun.finished_at,
+      resolvedRunSignals: targetRun.signals,
+      resolvedRunBacktestProfiles: targetRun.backtest_profiles
+    })
   };
+}
+
+export async function fetchBacktestRunOptions(input?: {
+  limit?: number | null;
+}): Promise<BacktestRunOption[]> {
+  const sql = getSql();
+  const limit = clampBacktestRunLimit(input?.limit ?? 20);
+  const rows = await sql<
+    {
+      run_id: string;
+      status: string;
+      started_at: string;
+      finished_at: string | null;
+      signals: number | null;
+      backtest_profiles: number | null;
+      has_backtest_run: boolean;
+    }[]
+  >`
+    select
+      r.id::text as run_id,
+      r.status,
+      r.started_at::text as started_at,
+      r.finished_at::text as finished_at,
+      nullif(r.metadata->>'signals', '')::int as signals,
+      nullif(r.metadata->>'backtest_profiles', '')::int as backtest_profiles,
+      (br.id is not null) as has_backtest_run
+    from runs r
+    left join lateral (
+      select id
+      from backtest_runs
+      where run_id = r.id
+      order by created_at desc
+      limit 1
+    ) br on true
+    where r.run_type = 'weekly'
+    order by coalesce(r.finished_at, r.started_at) desc
+    limit ${limit}
+  `;
+
+  return rows.map((r) => ({
+    runId: r.run_id,
+    status: r.status,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at,
+    signals: r.signals == null ? null : Number(r.signals),
+    backtestProfiles: r.backtest_profiles == null ? null : Number(r.backtest_profiles),
+    hasBacktestRun: Boolean(r.has_backtest_run)
+  }));
 }
 
 export async function fetchExecutionOrderIntents(input?: {
@@ -1075,6 +1467,307 @@ export async function fetchExecutionRiskSnapshots(input?: {
   }
 }
 
+export async function fetchEdgeStates(input?: {
+  marketScope?: EdgeStateRow["marketScope"] | null;
+  strategyName?: string | null;
+  symbol?: string | null;
+  limit?: number | null;
+}): Promise<EdgeStateRow[]> {
+  const sql = getSql();
+  const marketScope = input?.marketScope ?? null;
+  const strategyName = input?.strategyName?.trim() || null;
+  const symbol = input?.symbol?.trim() || null;
+  const limit = clampEdgeLimit(input?.limit ?? 120);
+
+  try {
+    const rows = await sql<
+      {
+        strategy_name: string;
+        strategy_version_id: string | null;
+        strategy_status: EdgeStateRow["strategyStatus"];
+        market_scope: EdgeStateRow["marketScope"];
+        symbol: string;
+        observed_at: string;
+        edge_score: number;
+        expected_net_edge_bps: number | null;
+        distance_to_entry_bps: number | null;
+        confidence: number | null;
+        market_regime: string | null;
+        explain: string | null;
+        risk_state: EdgeStateRow["riskState"];
+        risk_drawdown: number | null;
+        risk_sharpe_20d: number | null;
+        cooldown_until: string | null;
+        meta: Record<string, unknown> | null;
+      }[]
+    >`
+      select
+        es.strategy_name,
+        es.strategy_version_id::text as strategy_version_id,
+        s.status as strategy_status,
+        es.market_scope,
+        es.symbol,
+        es.observed_at::text as observed_at,
+        es.edge_score,
+        coalesce(es.expected_net_edge, es.expected_net_edge_bps) as expected_net_edge_bps,
+        coalesce(es.distance_to_entry, es.distance_to_entry_bps) as distance_to_entry_bps,
+        es.confidence,
+        coalesce(es.market_regime, es.market_scope) as market_regime,
+        es.explain,
+        rs.state as risk_state,
+        rs.drawdown as risk_drawdown,
+        rs.sharpe_20d as risk_sharpe_20d,
+        rs.cooldown_until::text as cooldown_until,
+        coalesce(es.meta, '{}'::jsonb) as meta
+      from edge_states es
+      left join strategy_versions sv on sv.id = es.strategy_version_id
+      left join strategies s on s.id = sv.strategy_id
+      left join lateral (
+        select
+          srs.state,
+          srs.drawdown,
+          srs.sharpe_20d,
+          srs.cooldown_until
+        from strategy_risk_snapshots srs
+        where srs.strategy_version_id = es.strategy_version_id
+        order by srs.as_of desc, srs.created_at desc
+        limit 1
+      ) rs on true
+      where (${marketScope}::text is null or es.market_scope = ${marketScope})
+        and (${strategyName}::text is null or es.strategy_name = ${strategyName})
+        and (${symbol}::text is null or es.symbol = ${symbol})
+      order by es.observed_at desc
+      limit ${limit}
+    `;
+
+    return rows.map((r) => ({
+      strategyName: r.strategy_name,
+      strategyVersionId: r.strategy_version_id,
+      strategyStatus: r.strategy_status,
+      marketScope: r.market_scope,
+      symbol: r.symbol,
+      observedAt: r.observed_at,
+      edgeScore: Number(r.edge_score ?? 0),
+      expectedNetEdgeBps: r.expected_net_edge_bps == null ? null : Number(r.expected_net_edge_bps),
+      distanceToEntryBps: r.distance_to_entry_bps == null ? null : Number(r.distance_to_entry_bps),
+      confidence: r.confidence == null ? null : Number(r.confidence),
+      marketRegime: r.market_regime,
+      explain: r.explain,
+      riskState: r.risk_state,
+      riskDrawdown: r.risk_drawdown == null ? null : Number(r.risk_drawdown),
+      riskSharpe20d: r.risk_sharpe_20d == null ? null : Number(r.risk_sharpe_20d),
+      cooldownUntil: r.cooldown_until,
+      meta: r.meta ?? {}
+    }));
+  } catch (error) {
+    if (
+      isUndefinedRelationError(error, "edge_states") ||
+      isUndefinedRelationError(error, "strategy_versions") ||
+      isUndefinedRelationError(error, "strategies") ||
+      isUndefinedRelationError(error, "strategy_risk_snapshots")
+    ) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function fetchEdgeTrend(input: {
+  strategyName: string;
+  symbol?: string | null;
+  marketScope?: EdgeStateRow["marketScope"] | null;
+  limit?: number | null;
+}): Promise<EdgeTrendPoint[]> {
+  const sql = getSql();
+  const strategyName = input.strategyName.trim();
+  if (!strategyName) {
+    return [];
+  }
+  const symbol = input.symbol?.trim() || null;
+  const marketScope = input.marketScope ?? null;
+  const limit = clampEdgeLimit(input.limit ?? 120);
+
+  try {
+    const rows = await sql<
+      {
+        strategy_name: string;
+        strategy_version_id: string | null;
+        symbol: string;
+        observed_at: string;
+        edge_score: number;
+        expected_net_edge_bps: number | null;
+        distance_to_entry_bps: number | null;
+        confidence: number | null;
+        risk_state: EdgeTrendPoint["riskState"];
+      }[]
+    >`
+      select
+        es.strategy_name,
+        es.strategy_version_id::text as strategy_version_id,
+        es.symbol,
+        es.observed_at::text as observed_at,
+        es.edge_score,
+        coalesce(es.expected_net_edge, es.expected_net_edge_bps) as expected_net_edge_bps,
+        coalesce(es.distance_to_entry, es.distance_to_entry_bps) as distance_to_entry_bps,
+        es.confidence,
+        rs.state as risk_state
+      from edge_states es
+      left join lateral (
+        select state
+        from strategy_risk_snapshots srs
+        where srs.strategy_version_id = es.strategy_version_id
+        order by srs.as_of desc, srs.created_at desc
+        limit 1
+      ) rs on true
+      where es.strategy_name = ${strategyName}
+        and (${marketScope}::text is null or es.market_scope = ${marketScope})
+        and (${symbol}::text is null or es.symbol = ${symbol})
+      order by es.observed_at desc
+      limit ${limit}
+    `;
+
+    return rows.map((r) => ({
+      strategyName: r.strategy_name,
+      strategyVersionId: r.strategy_version_id,
+      symbol: r.symbol,
+      observedAt: r.observed_at,
+      edgeScore: Number(r.edge_score ?? 0),
+      expectedNetEdgeBps: r.expected_net_edge_bps == null ? null : Number(r.expected_net_edge_bps),
+      distanceToEntryBps: r.distance_to_entry_bps == null ? null : Number(r.distance_to_entry_bps),
+      confidence: r.confidence == null ? null : Number(r.confidence),
+      riskState: r.risk_state
+    }));
+  } catch (error) {
+    if (
+      isUndefinedRelationError(error, "edge_states") ||
+      isUndefinedRelationError(error, "strategy_risk_snapshots")
+    ) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function fetchResearchKanban(input?: {
+  limitPerLane?: number | null;
+}): Promise<ResearchKanbanLane[]> {
+  const sql = getSql();
+  const limitPerLane = clampExecutionLimit(input?.limitPerLane ?? 8);
+  const order: ResearchKanbanStatus[] = ["new", "analyzing", "rejected", "candidate", "paper", "live"];
+
+  try {
+    const countRows = await sql<
+      {
+        lane: ResearchKanbanStatus;
+        cnt: number;
+      }[]
+    >`
+      with lane_rows as (
+        select status as lane
+        from ideas
+        where status in ('new', 'analyzing', 'rejected')
+        union all
+        select status as lane
+        from strategies
+        where status in ('candidate', 'paper', 'live')
+      )
+      select lane, count(*)::int as cnt
+      from lane_rows
+      group by lane
+    `;
+
+    const itemRows = await sql<
+      {
+        lane: ResearchKanbanStatus;
+        item_type: "idea" | "strategy";
+        item_id: string;
+        title: string;
+        subtitle: string | null;
+        updated_at: string;
+      }[]
+    >`
+      with idea_ranked as (
+        select
+          i.status as lane,
+          'idea'::text as item_type,
+          i.id::text as item_id,
+          i.title as title,
+          (i.source_type || coalesce(' @ ' || i.source_url, ''))::text as subtitle,
+          i.updated_at::text as updated_at,
+          row_number() over (partition by i.status order by i.priority desc, i.updated_at desc) as rn
+        from ideas i
+        where i.status in ('new', 'analyzing', 'rejected')
+      ),
+      strategy_ranked as (
+        select
+          s.status as lane,
+          'strategy'::text as item_type,
+          s.id::text as item_id,
+          s.name as title,
+          s.asset_scope::text as subtitle,
+          s.updated_at::text as updated_at,
+          row_number() over (partition by s.status order by s.updated_at desc, s.created_at desc) as rn
+        from strategies s
+        where s.status in ('candidate', 'paper', 'live')
+      ),
+      merged as (
+        select lane, item_type, item_id, title, subtitle, updated_at, rn from idea_ranked
+        union all
+        select lane, item_type, item_id, title, subtitle, updated_at, rn from strategy_ranked
+      )
+      select lane, item_type, item_id, title, subtitle, updated_at
+      from merged
+      where rn <= ${limitPerLane}
+      order by lane, rn
+    `;
+
+    const countByLane: Record<ResearchKanbanStatus, number> = {
+      new: 0,
+      analyzing: 0,
+      rejected: 0,
+      candidate: 0,
+      paper: 0,
+      live: 0
+    };
+    for (const row of countRows) {
+      countByLane[row.lane] = Number(row.cnt ?? 0);
+    }
+
+    const itemsByLane: Record<ResearchKanbanStatus, ResearchKanbanLane["items"]> = {
+      new: [],
+      analyzing: [],
+      rejected: [],
+      candidate: [],
+      paper: [],
+      live: []
+    };
+    for (const row of itemRows) {
+      itemsByLane[row.lane].push({
+        lane: row.lane,
+        itemType: row.item_type,
+        id: row.item_id,
+        title: row.title,
+        subtitle: row.subtitle,
+        updatedAt: row.updated_at
+      });
+    }
+
+    return order.map((lane) => ({
+      lane,
+      count: countByLane[lane],
+      items: itemsByLane[lane]
+    }));
+  } catch (error) {
+    if (
+      isUndefinedRelationError(error, "ideas") ||
+      isUndefinedRelationError(error, "strategies")
+    ) {
+      return order.map((lane) => ({ lane, count: 0, items: [] }));
+    }
+    throw error;
+  }
+}
+
 export async function fetchResearchStrategies(input?: {
   status?: ResearchStrategy["status"] | null;
   limit?: number | null;
@@ -1090,6 +1783,7 @@ export async function fetchResearchStrategies(input?: {
         strategy_name: string;
         asset_scope: ResearchStrategy["assetScope"];
         status: ResearchStrategy["status"];
+        live_candidate: boolean;
         updated_at: string;
         version_id: string | null;
         version: number | null;
@@ -1097,6 +1791,15 @@ export async function fetchResearchStrategies(input?: {
         sharpe: number | null;
         max_dd: number | null;
         cagr: number | null;
+        eval_run_id: string | null;
+        eval_metrics: Record<string, unknown> | null;
+        eval_artifacts: Record<string, unknown> | null;
+        paper_metrics: Record<string, unknown> | null;
+        last_lifecycle_action: string | null;
+        last_lifecycle_reason: string | null;
+        last_lifecycle_by: string | null;
+        last_lifecycle_at: string | null;
+        last_lifecycle_recheck_after: string | null;
       }[]
     >`
       with latest_versions as (
@@ -1113,48 +1816,101 @@ export async function fetchResearchStrategies(input?: {
           se.eval_type,
           nullif(se.metrics->>'sharpe', '')::double precision as sharpe,
           nullif(se.metrics->>'max_dd', '')::double precision as max_dd,
-          nullif(se.metrics->>'cagr', '')::double precision as cagr
+          nullif(se.metrics->>'cagr', '')::double precision as cagr,
+          nullif(se.artifacts->>'run_id', '')::text as eval_run_id,
+          se.metrics as eval_metrics,
+          se.artifacts as eval_artifacts
         from strategy_evaluations se
         order by se.strategy_version_id, se.created_at desc
+      ),
+      latest_paper_eval as (
+        select distinct on (se.strategy_version_id)
+          se.strategy_version_id,
+          se.metrics as paper_metrics
+        from strategy_evaluations se
+        where se.eval_type = 'paper'
+        order by se.strategy_version_id, se.created_at desc
+      ),
+      latest_lifecycle as (
+        select distinct on (slr.strategy_id)
+          slr.strategy_id,
+          slr.action as last_lifecycle_action,
+          slr.reason as last_lifecycle_reason,
+          slr.acted_by as last_lifecycle_by,
+          slr.acted_at::text as last_lifecycle_at,
+          slr.recheck_after::text as last_lifecycle_recheck_after
+        from strategy_lifecycle_reviews slr
+        order by slr.strategy_id, slr.acted_at desc, slr.created_at desc
       )
       select
         s.id::text as strategy_id,
         s.name as strategy_name,
         s.asset_scope,
         s.status,
+        s.live_candidate,
         s.updated_at::text as updated_at,
         lv.version_id,
         lv.version,
         le.eval_type,
         le.sharpe,
         le.max_dd,
-        le.cagr
+        le.cagr,
+        le.eval_run_id,
+        le.eval_metrics,
+        le.eval_artifacts,
+        pe.paper_metrics,
+        ll.last_lifecycle_action,
+        ll.last_lifecycle_reason,
+        ll.last_lifecycle_by,
+        ll.last_lifecycle_at,
+        ll.last_lifecycle_recheck_after
       from strategies s
       left join latest_versions lv on lv.strategy_id = s.id
       left join latest_eval le on le.strategy_version_id = lv.version_id::uuid
+      left join latest_paper_eval pe on pe.strategy_version_id = lv.version_id::uuid
+      left join latest_lifecycle ll on ll.strategy_id = s.id
       where (${status}::text is null or s.status = ${status})
       order by s.updated_at desc
       limit ${limit}
     `;
 
-    return rows.map((r) => ({
-      strategyId: r.strategy_id,
-      strategyName: r.strategy_name,
-      assetScope: r.asset_scope,
-      status: r.status,
-      updatedAt: r.updated_at,
-      versionId: r.version_id,
-      version: r.version,
-      evalType: r.eval_type,
-      sharpe: r.sharpe == null ? null : Number(r.sharpe),
-      maxDd: r.max_dd == null ? null : Number(r.max_dd),
-      cagr: r.cagr == null ? null : Number(r.cagr)
-    }));
+    return rows.map((r) => {
+      const paperMetrics = asRecord(r.paper_metrics);
+      return {
+        ...extractFoldValidationSummary(r.eval_metrics, r.eval_artifacts),
+        strategyId: r.strategy_id,
+        strategyName: r.strategy_name,
+        assetScope: r.asset_scope,
+        status: r.status,
+        liveCandidate: Boolean(r.live_candidate),
+        updatedAt: r.updated_at,
+        versionId: r.version_id,
+        version: r.version,
+        evalRunId: r.eval_run_id,
+        evalType: r.eval_type,
+        sharpe: r.sharpe == null ? null : Number(r.sharpe),
+        maxDd: r.max_dd == null ? null : Number(r.max_dd),
+        cagr: r.cagr == null ? null : Number(r.cagr),
+        paperDays: asNumber(paperMetrics?.paper_days),
+        paperRoundTrips: asNumber(paperMetrics?.round_trips),
+        paperSharpe20d: asNumber(paperMetrics?.sharpe_20d),
+        paperMaxDrawdown: asNumber(paperMetrics?.max_drawdown),
+        paperGateDaysOk: asBoolean(paperMetrics?.days_ok),
+        paperGateRoundTripsOk: asBoolean(paperMetrics?.round_trips_ok),
+        paperGateRiskOk: asBoolean(paperMetrics?.risk_ok),
+        lastLifecycleAction: r.last_lifecycle_action,
+        lastLifecycleReason: r.last_lifecycle_reason,
+        lastLifecycleBy: r.last_lifecycle_by,
+        lastLifecycleAt: r.last_lifecycle_at,
+        lastLifecycleRecheckAfter: r.last_lifecycle_recheck_after
+      };
+    });
   } catch (error) {
     if (
       isUndefinedRelationError(error, "strategies") ||
       isUndefinedRelationError(error, "strategy_versions") ||
-      isUndefinedRelationError(error, "strategy_evaluations")
+      isUndefinedRelationError(error, "strategy_evaluations") ||
+      isUndefinedRelationError(error, "strategy_lifecycle_reviews")
     ) {
       return [];
     }
@@ -1282,6 +2038,211 @@ export async function fetchResearchAgentTasks(input?: {
     }
     throw error;
   }
+}
+
+export async function fetchResearchLifecycleReviews(input?: {
+  strategyId?: string | null;
+  limit?: number | null;
+}): Promise<ResearchLifecycleReview[]> {
+  const sql = getSql();
+  const strategyId = input?.strategyId?.trim() || null;
+  const limit = clampExecutionLimit(input?.limit ?? 50);
+
+  try {
+    const rows = await sql<
+      {
+        id: string;
+        strategy_id: string;
+        strategy_name: string;
+        strategy_version_id: string | null;
+        action: string;
+        from_status: string;
+        to_status: string;
+        live_candidate: boolean;
+        reason: string | null;
+        recheck_condition: string | null;
+        recheck_after: string | null;
+        acted_by: string;
+        acted_at: string;
+      }[]
+    >`
+      select
+        slr.id::text as id,
+        slr.strategy_id::text as strategy_id,
+        s.name as strategy_name,
+        slr.strategy_version_id::text as strategy_version_id,
+        slr.action,
+        slr.from_status,
+        slr.to_status,
+        slr.live_candidate,
+        slr.reason,
+        slr.recheck_condition,
+        slr.recheck_after::text as recheck_after,
+        slr.acted_by,
+        slr.acted_at::text as acted_at
+      from strategy_lifecycle_reviews slr
+      join strategies s on s.id = slr.strategy_id
+      where (${strategyId}::uuid is null or slr.strategy_id = ${strategyId}::uuid)
+      order by slr.acted_at desc, slr.created_at desc
+      limit ${limit}
+    `;
+    return rows.map((r) => ({
+      id: r.id,
+      strategyId: r.strategy_id,
+      strategyName: r.strategy_name,
+      strategyVersionId: r.strategy_version_id,
+      action: r.action,
+      fromStatus: r.from_status,
+      toStatus: r.to_status,
+      liveCandidate: Boolean(r.live_candidate),
+      reason: r.reason,
+      recheckCondition: r.recheck_condition,
+      recheckAfter: r.recheck_after,
+      actedBy: r.acted_by,
+      actedAt: r.acted_at
+    }));
+  } catch (error) {
+    if (
+      isUndefinedRelationError(error, "strategy_lifecycle_reviews") ||
+      isUndefinedRelationError(error, "strategies")
+    ) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function applyResearchStrategyLifecycleAction(input: {
+  strategyId: string;
+  action: "promote_paper" | "approve_live" | "reject_live";
+  actedBy: string;
+  reason?: string | null;
+  recheckCondition?: string | null;
+  recheckAfter?: string | null;
+}): Promise<{ strategyId: string; status: ResearchStrategy["status"]; liveCandidate: boolean }> {
+  const sql = getSql();
+  const strategyId = input.strategyId.trim();
+  if (!strategyId) {
+    throw new Error("strategyId is required");
+  }
+  const actedBy = input.actedBy.trim() || "web-ui";
+  const reason = input.reason?.trim() || null;
+  const recheckCondition = input.recheckCondition?.trim() || null;
+  const recheckAfter = input.recheckAfter?.trim() || null;
+
+  const rows = await sql<
+    {
+      strategy_id: string;
+      status: ResearchStrategy["status"];
+      live_candidate: boolean;
+      strategy_version_id: string | null;
+    }[]
+  >`
+    with latest_versions as (
+      select distinct on (sv.strategy_id)
+        sv.strategy_id,
+        sv.id::text as strategy_version_id
+      from strategy_versions sv
+      order by sv.strategy_id, sv.version desc
+    )
+    select
+      s.id::text as strategy_id,
+      s.status,
+      s.live_candidate,
+      lv.strategy_version_id
+    from strategies s
+    left join latest_versions lv on lv.strategy_id = s.id
+    where s.id = ${strategyId}::uuid
+    limit 1
+  `;
+  const current = rows[0];
+  if (!current) {
+    throw new Error("strategy not found");
+  }
+
+  let toStatus: ResearchStrategy["status"] = current.status;
+  let toLiveCandidate = current.live_candidate;
+
+  if (input.action === "promote_paper") {
+    toStatus = "paper";
+    toLiveCandidate = false;
+  } else if (input.action === "approve_live") {
+    if (!current.strategy_version_id) {
+      throw new Error("latest strategy version is missing");
+    }
+    if (!current.live_candidate) {
+      throw new Error("strategy is not live_candidate");
+    }
+    if (!(current.status === "paper" || current.status === "approved")) {
+      throw new Error(`cannot approve_live from status=${current.status}`);
+    }
+    toStatus = "live";
+    toLiveCandidate = false;
+  } else if (input.action === "reject_live") {
+    toStatus = current.status === "approved" ? "paper" : current.status;
+    toLiveCandidate = false;
+  }
+
+  await sql.begin(async (tx) => {
+    await tx`
+      update strategies
+      set status = ${toStatus},
+          live_candidate = ${toLiveCandidate},
+          updated_at = now()
+      where id = ${strategyId}::uuid
+    `;
+
+    if (input.action === "approve_live") {
+      await tx`
+        update strategy_versions
+        set
+          is_active = (id = ${current.strategy_version_id}::uuid),
+          approved_by = case when id = ${current.strategy_version_id}::uuid then ${actedBy} else approved_by end,
+          approved_at = case when id = ${current.strategy_version_id}::uuid then now() else approved_at end
+        where strategy_id = ${strategyId}::uuid
+      `;
+    }
+
+    await tx`
+      insert into strategy_lifecycle_reviews (
+        strategy_id,
+        strategy_version_id,
+        action,
+        from_status,
+        to_status,
+        live_candidate,
+        reason,
+        recheck_condition,
+        recheck_after,
+        acted_by,
+        acted_at,
+        metadata
+      ) values (
+        ${strategyId}::uuid,
+        ${current.strategy_version_id}::uuid,
+        ${input.action},
+        ${current.status},
+        ${toStatus},
+        ${toLiveCandidate},
+        ${reason},
+        ${recheckCondition},
+        ${recheckAfter}::date,
+        ${actedBy},
+        now(),
+        ${JSON.stringify({
+          reason,
+          recheckCondition,
+          recheckAfter
+        })}::jsonb
+      )
+    `;
+  });
+
+  return {
+    strategyId,
+    status: toStatus,
+    liveCandidate: toLiveCandidate
+  };
 }
 
 export async function createChatSessionIfNeeded(sessionId?: string): Promise<string> {
@@ -1447,4 +2408,682 @@ export async function searchEvidenceFromReports(
   }
 
   return out;
+}
+
+function asObjectRecord(value: unknown): Record<string, unknown> {
+  return asRecord(value) ?? {};
+}
+
+export async function createResearchExternalInput(input: {
+  sessionId: string;
+  messageId?: string | null;
+  sourceType: ResearchInputRecord["sourceType"];
+  sourceUrl?: string | null;
+  rawText?: string | null;
+  extractedText?: string | null;
+  qualityGrade?: ResearchInputRecord["qualityGrade"];
+  extractionStatus?: ResearchInputRecord["extractionStatus"];
+  userComment?: string | null;
+  metadata?: Record<string, unknown>;
+}): Promise<string> {
+  const sql = getSql();
+  const id = randomUUID();
+  await sql`
+    insert into external_inputs (
+      id,
+      session_id,
+      message_id,
+      source_type,
+      source_url,
+      raw_text,
+      extracted_text,
+      quality_grade,
+      extraction_status,
+      user_comment,
+      metadata
+    ) values (
+      ${id}::uuid,
+      ${input.sessionId}::uuid,
+      ${input.messageId ?? null}::uuid,
+      ${input.sourceType},
+      ${input.sourceUrl ?? null},
+      ${input.rawText ?? null},
+      ${input.extractedText ?? null},
+      ${input.qualityGrade ?? null},
+      ${input.extractionStatus ?? "queued"},
+      ${input.userComment ?? null},
+      ${JSON.stringify(input.metadata ?? {})}::jsonb
+    )
+  `;
+  return id;
+}
+
+export async function createResearchHypothesis(input: {
+  sessionId: string;
+  externalInputId?: string | null;
+  parentMessageId?: string | null;
+  stance: ResearchHypothesisRecord["stance"];
+  horizonDays: number;
+  thesisMd: string;
+  falsificationMd: string;
+  confidence?: number | null;
+  status?: ResearchHypothesisRecord["status"];
+  isFavorite?: boolean;
+  metadata?: Record<string, unknown>;
+  assets?: Array<{
+    assetClass: "JP_EQ" | "US_EQ" | "CRYPTO";
+    securityId?: string | null;
+    symbolText?: string | null;
+    weightHint?: number | null;
+    confidence?: number | null;
+  }>;
+}): Promise<string> {
+  const sql = getSql();
+  const id = randomUUID();
+  await sql.begin(async (trx) => {
+    await trx`
+      insert into research_hypotheses (
+        id,
+        session_id,
+        external_input_id,
+        parent_message_id,
+        stance,
+        horizon_days,
+        thesis_md,
+        falsification_md,
+        confidence,
+        status,
+        is_favorite,
+        metadata
+      ) values (
+        ${id}::uuid,
+        ${input.sessionId}::uuid,
+        ${input.externalInputId ?? null}::uuid,
+        ${input.parentMessageId ?? null}::uuid,
+        ${input.stance},
+        ${input.horizonDays},
+        ${input.thesisMd},
+        ${input.falsificationMd},
+        ${input.confidence ?? null},
+        ${input.status ?? "draft"},
+        ${input.isFavorite ?? false},
+        ${JSON.stringify(input.metadata ?? {})}::jsonb
+      )
+    `;
+    for (const asset of input.assets ?? []) {
+      await trx`
+        insert into research_hypothesis_assets (
+          id,
+          hypothesis_id,
+          asset_class,
+          security_id,
+          symbol_text,
+          weight_hint,
+          confidence
+        ) values (
+          ${randomUUID()}::uuid,
+          ${id}::uuid,
+          ${asset.assetClass},
+          ${asset.securityId ?? null}::uuid,
+          ${asset.symbolText ?? null},
+          ${asset.weightHint ?? null},
+          ${asset.confidence ?? null}
+        )
+      `;
+    }
+  });
+  return id;
+}
+
+export async function createResearchArtifact(input: {
+  sessionId: string;
+  hypothesisId?: string | null;
+  artifactType: ResearchArtifactRecord["artifactType"];
+  title: string;
+  bodyMd?: string | null;
+  codeText?: string | null;
+  language?: string | null;
+  isFavorite?: boolean;
+  createdByTaskId?: string | null;
+  metadata?: Record<string, unknown>;
+}): Promise<string> {
+  const sql = getSql();
+  const id = randomUUID();
+  await sql`
+    insert into research_artifacts (
+      id,
+      session_id,
+      hypothesis_id,
+      artifact_type,
+      title,
+      body_md,
+      code_text,
+      language,
+      is_favorite,
+      created_by_task_id,
+      metadata
+    ) values (
+      ${id}::uuid,
+      ${input.sessionId}::uuid,
+      ${input.hypothesisId ?? null}::uuid,
+      ${input.artifactType},
+      ${input.title},
+      ${input.bodyMd ?? null},
+      ${input.codeText ?? null},
+      ${input.language ?? null},
+      ${input.isFavorite ?? false},
+      ${input.createdByTaskId ?? null}::uuid,
+      ${JSON.stringify(input.metadata ?? {})}::jsonb
+    )
+  `;
+  return id;
+}
+
+export async function enqueueResearchAgentTask(input: {
+  sessionId: string;
+  taskType: string;
+  payload: Record<string, unknown>;
+  priority?: number;
+  parentTaskId?: string | null;
+  assignedRole?: string | null;
+  dedupeKey?: string | null;
+}): Promise<string> {
+  const sql = getSql();
+  const id = randomUUID();
+  await sql`
+    insert into agent_tasks (
+      id,
+      session_id,
+      parent_task_id,
+      task_type,
+      priority,
+      status,
+      payload,
+      dedupe_key,
+      assigned_role
+    ) values (
+      ${id}::uuid,
+      ${input.sessionId}::uuid,
+      ${input.parentTaskId ?? null}::uuid,
+      ${input.taskType},
+      ${input.priority ?? 100},
+      'queued',
+      ${JSON.stringify(input.payload)}::jsonb,
+      ${input.dedupeKey ?? null},
+      ${input.assignedRole ?? null}
+    )
+  `;
+  return id;
+}
+
+export async function fetchResearchInputs(options?: {
+  sessionId?: string | null;
+  limit?: number;
+}): Promise<ResearchInputRecord[]> {
+  const sql = getSql();
+  const limit = Math.min(200, Math.max(1, Math.trunc(options?.limit ?? 50)));
+  try {
+    const rows = await sql<
+      {
+        id: string;
+        session_id: string;
+        message_id: string | null;
+        source_type: ResearchInputRecord["sourceType"];
+        source_url: string | null;
+        raw_text: string | null;
+        extracted_text: string | null;
+        quality_grade: ResearchInputRecord["qualityGrade"];
+        extraction_status: ResearchInputRecord["extractionStatus"];
+        user_comment: string | null;
+        metadata: unknown;
+        created_at: string;
+      }[]
+    >`
+      select
+        id::text,
+        session_id::text,
+        message_id::text,
+        source_type,
+        source_url,
+        raw_text,
+        extracted_text,
+        quality_grade,
+        extraction_status,
+        user_comment,
+        metadata,
+        created_at::text
+      from external_inputs
+      where (${options?.sessionId ?? null}::uuid is null or session_id = ${options?.sessionId ?? null}::uuid)
+      order by created_at desc
+      limit ${limit}
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      sessionId: row.session_id,
+      messageId: row.message_id,
+      sourceType: row.source_type,
+      sourceUrl: row.source_url,
+      rawText: row.raw_text,
+      extractedText: row.extracted_text,
+      qualityGrade: row.quality_grade,
+      extractionStatus: row.extraction_status,
+      userComment: row.user_comment,
+      metadata: asObjectRecord(row.metadata),
+      createdAt: row.created_at
+    }));
+  } catch (error) {
+    if (isUndefinedRelationError(error, "external_inputs")) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function fetchResearchHypotheses(options?: {
+  sessionId?: string | null;
+  limit?: number;
+}): Promise<ResearchHypothesisRecord[]> {
+  const sql = getSql();
+  const limit = Math.min(200, Math.max(1, Math.trunc(options?.limit ?? 50)));
+  try {
+    const rows = await sql<
+      {
+        id: string;
+        session_id: string;
+        external_input_id: string | null;
+        parent_message_id: string | null;
+        stance: ResearchHypothesisRecord["stance"];
+        horizon_days: number;
+        thesis_md: string;
+        falsification_md: string;
+        confidence: number | null;
+        status: ResearchHypothesisRecord["status"];
+        is_favorite: boolean;
+        version: number;
+        metadata: unknown;
+        created_at: string;
+      }[]
+    >`
+      select
+        id::text,
+        session_id::text,
+        external_input_id::text,
+        parent_message_id::text,
+        stance,
+        horizon_days,
+        thesis_md,
+        falsification_md,
+        confidence::float8 as confidence,
+        status,
+        is_favorite,
+        version,
+        metadata,
+        created_at::text
+      from research_hypotheses
+      where (${options?.sessionId ?? null}::uuid is null or session_id = ${options?.sessionId ?? null}::uuid)
+      order by created_at desc
+      limit ${limit}
+    `;
+    const hypothesisIds = rows.map((row) => row.id);
+    const assets = hypothesisIds.length > 0
+      ? await sql<
+          {
+            id: string;
+            hypothesis_id: string;
+            asset_class: "JP_EQ" | "US_EQ" | "CRYPTO";
+            security_id: string | null;
+            symbol_text: string | null;
+            ticker: string | null;
+            name: string | null;
+            market: "JP" | "US" | null;
+            weight_hint: number | null;
+            confidence: number | null;
+          }[]
+        >`
+          select
+            a.id::text,
+            a.hypothesis_id::text,
+            a.asset_class,
+            s.security_id,
+            a.symbol_text,
+            s.ticker,
+            s.name,
+            s.market,
+            a.weight_hint::float8 as weight_hint,
+            a.confidence::float8 as confidence
+          from research_hypothesis_assets a
+          left join securities s on s.id = a.security_id
+          where a.hypothesis_id = any(${hypothesisIds}::uuid[])
+          order by a.created_at asc
+        `
+      : [];
+    const assetsByHypothesis = new Map<string, ResearchHypothesisRecord["assets"]>();
+    for (const asset of assets) {
+      const bucket = assetsByHypothesis.get(asset.hypothesis_id) ?? [];
+      bucket.push({
+        id: asset.id,
+        assetClass: asset.asset_class,
+        securityId: asset.security_id,
+        symbolText: asset.symbol_text,
+        ticker: asset.ticker,
+        name: asset.name,
+        market: asset.market,
+        weightHint: asset.weight_hint,
+        confidence: asset.confidence
+      });
+      assetsByHypothesis.set(asset.hypothesis_id, bucket);
+    }
+    return rows.map((row) => ({
+      id: row.id,
+      sessionId: row.session_id,
+      externalInputId: row.external_input_id,
+      parentMessageId: row.parent_message_id,
+      stance: row.stance,
+      horizonDays: row.horizon_days,
+      thesisMd: row.thesis_md,
+      falsificationMd: row.falsification_md,
+      confidence: row.confidence,
+      status: row.status,
+      isFavorite: row.is_favorite,
+      version: row.version,
+      metadata: asObjectRecord(row.metadata),
+      createdAt: row.created_at,
+      assets: assetsByHypothesis.get(row.id) ?? []
+    }));
+  } catch (error) {
+    if (isUndefinedRelationError(error, "research_hypotheses")) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function fetchResearchArtifacts(options?: {
+  sessionId?: string | null;
+  limit?: number;
+}): Promise<ResearchArtifactRecord[]> {
+  const sql = getSql();
+  const limit = Math.min(200, Math.max(1, Math.trunc(options?.limit ?? 50)));
+  try {
+    const rows = await sql<
+      {
+        id: string;
+        session_id: string;
+        hypothesis_id: string | null;
+        artifact_type: ResearchArtifactRecord["artifactType"];
+        title: string;
+        body_md: string | null;
+        code_text: string | null;
+        language: string | null;
+        is_favorite: boolean;
+        created_by_task_id: string | null;
+        metadata: unknown;
+        created_at: string;
+        run_id: string | null;
+        run_status: ResearchArtifactRunStatus | null;
+        stdout_text: string | null;
+        stderr_text: string | null;
+        result_json: unknown;
+        output_r2_key: string | null;
+        run_created_at: string | null;
+      }[]
+    >`
+      select
+        a.id::text,
+        a.session_id::text,
+        a.hypothesis_id::text,
+        a.artifact_type,
+        a.title,
+        a.body_md,
+        a.code_text,
+        a.language,
+        a.is_favorite,
+        a.created_by_task_id::text,
+        a.metadata,
+        a.created_at::text,
+        ar.id::text as run_id,
+        ar.run_status,
+        ar.stdout_text,
+        ar.stderr_text,
+        ar.result_json,
+        ar.output_r2_key,
+        ar.created_at::text as run_created_at
+      from research_artifacts a
+      left join lateral (
+        select *
+        from research_artifact_runs ar
+        where ar.artifact_id = a.id
+        order by ar.created_at desc
+        limit 1
+      ) ar on true
+      where (${options?.sessionId ?? null}::uuid is null or a.session_id = ${options?.sessionId ?? null}::uuid)
+      order by a.created_at desc
+      limit ${limit}
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      sessionId: row.session_id,
+      hypothesisId: row.hypothesis_id,
+      artifactType: row.artifact_type,
+      title: row.title,
+      bodyMd: row.body_md,
+      codeText: row.code_text,
+      language: row.language,
+      isFavorite: row.is_favorite,
+      createdByTaskId: row.created_by_task_id,
+      metadata: asObjectRecord(row.metadata),
+      createdAt: row.created_at,
+      latestRun: row.run_id ? {
+        id: row.run_id,
+        runStatus: row.run_status ?? "pending",
+        stdoutText: row.stdout_text,
+        stderrText: row.stderr_text,
+        resultJson: asObjectRecord(row.result_json),
+        outputR2Key: row.output_r2_key,
+        createdAt: row.run_created_at ?? row.created_at
+      } : null
+    }));
+  } catch (error) {
+    if (isUndefinedRelationError(error, "research_artifacts")) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function fetchResearchValidation(options?: {
+  sessionId?: string | null;
+  limit?: number;
+}): Promise<ResearchHypothesisOutcomeRecord[]> {
+  const sql = getSql();
+  const limit = Math.min(200, Math.max(1, Math.trunc(options?.limit ?? 50)));
+  try {
+    const rows = await sql<
+      {
+        id: string;
+        hypothesis_id: string;
+        checked_at: string;
+        ret_1d: number | null;
+        ret_5d: number | null;
+        ret_20d: number | null;
+        mfe: number | null;
+        mae: number | null;
+        outcome_label: ResearchHypothesisOutcomeRecord["outcomeLabel"];
+        summary_md: string | null;
+        metadata: unknown;
+        session_id: string | null;
+        stance: ResearchHypothesisRecord["stance"] | null;
+        horizon_days: number | null;
+        thesis_md: string | null;
+        confidence: number | null;
+        status: ResearchHypothesisRecord["status"] | null;
+      }[]
+    >`
+      select
+        o.id::text,
+        o.hypothesis_id::text,
+        o.checked_at::text,
+        o.ret_1d::float8 as ret_1d,
+        o.ret_5d::float8 as ret_5d,
+        o.ret_20d::float8 as ret_20d,
+        o.mfe::float8 as mfe,
+        o.mae::float8 as mae,
+        o.outcome_label,
+        o.summary_md,
+        o.metadata,
+        h.session_id::text,
+        h.stance,
+        h.horizon_days,
+        h.thesis_md,
+        h.confidence::float8 as confidence,
+        h.status
+      from research_hypothesis_outcomes o
+      left join research_hypotheses h on h.id = o.hypothesis_id
+      where (${options?.sessionId ?? null}::uuid is null or h.session_id = ${options?.sessionId ?? null}::uuid)
+      order by o.checked_at desc
+      limit ${limit}
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      hypothesisId: row.hypothesis_id,
+      checkedAt: row.checked_at,
+      ret1d: row.ret_1d,
+      ret5d: row.ret_5d,
+      ret20d: row.ret_20d,
+      mfe: row.mfe,
+      mae: row.mae,
+      outcomeLabel: row.outcome_label,
+      summaryMd: row.summary_md,
+      metadata: asObjectRecord(row.metadata),
+      hypothesis: row.session_id && row.stance && row.horizon_days && row.thesis_md ? {
+        sessionId: row.session_id,
+        stance: row.stance,
+        horizonDays: row.horizon_days,
+        thesisMd: row.thesis_md,
+        confidence: row.confidence,
+        status: row.status ?? "draft"
+      } : null
+    }));
+  } catch (error) {
+    if (isUndefinedRelationError(error, "research_hypothesis_outcomes")) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function fetchResearchSessionMessages(sessionId: string): Promise<ResearchChatMessageRecord[]> {
+  const sql = getSql();
+  const rows = await sql<
+    {
+      id: string;
+      session_id: string;
+      role: ResearchChatMessageRecord["role"];
+      content: string;
+      answer_before: string | null;
+      answer_after: string | null;
+      change_reason: string | null;
+      created_at: string;
+    }[]
+  >`
+    select
+      id::text,
+      session_id::text,
+      role,
+      content,
+      answer_before,
+      answer_after,
+      change_reason,
+      created_at::text
+    from chat_messages
+    where session_id = ${sessionId}::uuid
+    order by created_at asc
+  `;
+  return rows.map((row) => ({
+    id: row.id,
+    sessionId: row.session_id,
+    role: row.role,
+    content: row.content,
+    answerBefore: row.answer_before,
+    answerAfter: row.answer_after,
+    changeReason: row.change_reason,
+    createdAt: row.created_at
+  }));
+}
+
+export async function fetchResearchSessionDetail(sessionId: string): Promise<ResearchChatSessionDetail | null> {
+  const sql = getSql();
+  const sessionRows = await sql<{ id: string; title: string | null }[]>`
+    select id::text, title
+    from chat_sessions
+    where id = ${sessionId}::uuid
+    limit 1
+  `;
+  const session = sessionRows[0];
+  if (!session) {
+    return null;
+  }
+  const [messages, inputs, hypotheses, artifacts] = await Promise.all([
+    fetchResearchSessionMessages(sessionId),
+    fetchResearchInputs({ sessionId, limit: 100 }),
+    fetchResearchHypotheses({ sessionId, limit: 100 }),
+    fetchResearchArtifacts({ sessionId, limit: 100 })
+  ]);
+  return {
+    sessionId: session.id,
+    title: session.title,
+    messages,
+    inputs,
+    hypotheses,
+    artifacts
+  };
+}
+
+export async function fetchResearchSessions(limit: number = 50): Promise<ResearchSessionListItem[]> {
+  const sql = getSql();
+  const normalizedLimit = Math.min(200, Math.max(1, Math.trunc(limit)));
+  const rows = await sql<
+    {
+      session_id: string;
+      title: string | null;
+      created_at: string;
+      message_count: number;
+      input_count: number;
+      hypothesis_count: number;
+      latest_assistant_message: string | null;
+    }[]
+  >`
+    select
+      s.id::text as session_id,
+      s.title,
+      s.created_at::text,
+      (select count(*)::int from chat_messages m where m.session_id = s.id) as message_count,
+      (select count(*)::int from external_inputs e where e.session_id = s.id) as input_count,
+      (select count(*)::int from research_hypotheses h where h.session_id = s.id) as hypothesis_count,
+      (
+        select m.content
+        from chat_messages m
+        where m.session_id = s.id
+          and m.role = 'assistant'
+        order by m.created_at desc
+        limit 1
+      ) as latest_assistant_message
+    from chat_sessions s
+    where exists (
+      select 1
+      from external_inputs e
+      where e.session_id = s.id
+    )
+    order by s.created_at desc
+    limit ${normalizedLimit}
+  `;
+  return rows.map((row) => ({
+    sessionId: row.session_id,
+    title: row.title,
+    createdAt: row.created_at,
+    messageCount: row.message_count,
+    inputCount: row.input_count,
+    hypothesisCount: row.hypothesis_count,
+    latestAssistantMessage: row.latest_assistant_message,
+  }));
 }

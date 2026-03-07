@@ -74,6 +74,7 @@ def test_load_jp_securities_live_supports_v2_field_names(monkeypatch: pytest.Mon
         secrets=RuntimeSecrets(
             database_url="postgresql://placeholder",
             discord_webhook_url=None,
+            discord_bot_token=None,
             openai_api_key=None,
             r2_account_id=None,
             r2_access_key_id=None,

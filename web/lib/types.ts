@@ -83,6 +83,47 @@ export type BacktestPoint = {
   benchmarkEquity: number | null;
 };
 
+export type BacktestReasonCode =
+  | "ok"
+  | "no_signals"
+  | "no_weekly_run"
+  | "requested_run_not_found"
+  | "requested_run_has_no_backtest"
+  | "latest_weekly_has_no_backtest"
+  | "no_backtest_run"
+  | "no_metrics"
+  | "no_curve";
+
+export type BacktestRunOption = {
+  runId: string;
+  status: string;
+  startedAt: string;
+  finishedAt: string | null;
+  signals: number | null;
+  backtestProfiles: number | null;
+  hasBacktestRun: boolean;
+};
+
+export type BacktestMeta = {
+  requestedRunId: string | null;
+  resolvedRunId: string | null;
+  latestWeeklyRunId: string | null;
+  latestWithBacktestRunId: string | null;
+  resolvedSource: "requested" | "latest_weekly" | "latest_with_backtest" | "none";
+  reasonCode: BacktestReasonCode;
+  resolvedRunStatus: string | null;
+  resolvedRunStartedAt: string | null;
+  resolvedRunFinishedAt: string | null;
+  resolvedRunSignals: number | null;
+  resolvedRunBacktestProfiles: number | null;
+};
+
+export type BacktestData = {
+  metrics: BacktestMetric[];
+  curve: BacktestPoint[];
+  meta: BacktestMeta;
+};
+
 export type SecurityTimelinePrice = {
   date: string;
   close: number;
@@ -186,18 +227,236 @@ export type ExecutionRiskSnapshot = {
   createdAt: string;
 };
 
+export type EdgeStateRow = {
+  strategyName: string;
+  strategyVersionId: string | null;
+  strategyStatus: "draft" | "candidate" | "approved" | "paper" | "live" | "paused" | "retired" | null;
+  marketScope: "JP_EQ" | "US_EQ" | "CRYPTO" | "MIXED";
+  symbol: string;
+  observedAt: string;
+  edgeScore: number;
+  expectedNetEdgeBps: number | null;
+  distanceToEntryBps: number | null;
+  confidence: number | null;
+  marketRegime: string | null;
+  explain: string | null;
+  riskState: "normal" | "warning" | "halted" | "cooldown" | null;
+  riskDrawdown: number | null;
+  riskSharpe20d: number | null;
+  cooldownUntil: string | null;
+  meta: Record<string, unknown>;
+};
+
+export type EdgeTrendPoint = {
+  strategyName: string;
+  strategyVersionId: string | null;
+  symbol: string;
+  observedAt: string;
+  edgeScore: number;
+  expectedNetEdgeBps: number | null;
+  distanceToEntryBps: number | null;
+  confidence: number | null;
+  riskState: "normal" | "warning" | "halted" | "cooldown" | null;
+};
+
+export type ResearchInputRecord = {
+  id: string;
+  sessionId: string;
+  messageId: string | null;
+  sourceType: "discord" | "web" | "x" | "youtube" | "web_url" | "text";
+  sourceUrl: string | null;
+  rawText: string | null;
+  extractedText: string | null;
+  qualityGrade: "A" | "B" | "C" | null;
+  extractionStatus: "queued" | "success" | "partial" | "failed";
+  userComment: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type ResearchHypothesisAsset = {
+  id: string;
+  assetClass: "JP_EQ" | "US_EQ" | "CRYPTO";
+  securityId: string | null;
+  symbolText: string | null;
+  ticker: string | null;
+  name: string | null;
+  market: "JP" | "US" | null;
+  weightHint: number | null;
+  confidence: number | null;
+};
+
+export type ResearchHypothesisRecord = {
+  id: string;
+  sessionId: string;
+  externalInputId: string | null;
+  parentMessageId: string | null;
+  stance: "bullish" | "bearish" | "neutral" | "watch";
+  horizonDays: number;
+  thesisMd: string;
+  falsificationMd: string;
+  confidence: number | null;
+  status: "draft" | "watch" | "validate" | "passed" | "failed" | "archived";
+  isFavorite: boolean;
+  version: number;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  assets: ResearchHypothesisAsset[];
+};
+
+export type ResearchArtifactRecord = {
+  id: string;
+  sessionId: string;
+  hypothesisId: string | null;
+  artifactType: "sql" | "python" | "chart" | "table" | "note" | "report";
+  title: string;
+  bodyMd: string | null;
+  codeText: string | null;
+  language: string | null;
+  isFavorite: boolean;
+  createdByTaskId: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  latestRun: {
+    id: string;
+    runStatus: ResearchArtifactRunStatus;
+    stdoutText: string | null;
+    stderrText: string | null;
+    resultJson: Record<string, unknown>;
+    outputR2Key: string | null;
+    createdAt: string;
+  } | null;
+};
+
+export type ResearchArtifactRunStatus = "pending" | "running" | "success" | "failed";
+
+export type ResearchHypothesisOutcomeRecord = {
+  id: string;
+  hypothesisId: string;
+  checkedAt: string;
+  ret1d: number | null;
+  ret5d: number | null;
+  ret20d: number | null;
+  mfe: number | null;
+  mae: number | null;
+  outcomeLabel: "hit" | "miss" | "partial" | "open";
+  summaryMd: string | null;
+  metadata: Record<string, unknown>;
+  hypothesis: Pick<ResearchHypothesisRecord, "stance" | "horizonDays" | "thesisMd" | "confidence" | "status" | "sessionId"> | null;
+};
+
+export type ResearchChatMessageRecord = {
+  id: string;
+  sessionId: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  answerBefore: string | null;
+  answerAfter: string | null;
+  changeReason: string | null;
+  createdAt: string;
+};
+
+export type ResearchChatSessionDetail = {
+  sessionId: string;
+  title: string | null;
+  messages: ResearchChatMessageRecord[];
+  inputs: ResearchInputRecord[];
+  hypotheses: ResearchHypothesisRecord[];
+  artifacts: ResearchArtifactRecord[];
+};
+
+export type ResearchSessionListItem = {
+  sessionId: string;
+  title: string | null;
+  createdAt: string;
+  messageCount: number;
+  inputCount: number;
+  hypothesisCount: number;
+  latestAssistantMessage: string | null;
+};
+
+export type ResearchKanbanStatus = "new" | "analyzing" | "rejected" | "candidate" | "paper" | "live";
+
+export type ResearchKanbanItem = {
+  lane: ResearchKanbanStatus;
+  itemType: "idea" | "strategy";
+  id: string;
+  title: string;
+  subtitle: string | null;
+  updatedAt: string;
+};
+
+export type ResearchKanbanLane = {
+  lane: ResearchKanbanStatus;
+  count: number;
+  items: ResearchKanbanItem[];
+};
+
 export type ResearchStrategy = {
   strategyId: string;
   strategyName: string;
   assetScope: "JP_EQ" | "US_EQ" | "CRYPTO" | "MIXED";
   status: "draft" | "candidate" | "approved" | "paper" | "live" | "paused" | "retired";
+  liveCandidate: boolean;
   updatedAt: string;
   versionId: string | null;
   version: number | null;
+  evalRunId: string | null;
   evalType: "quick_backtest" | "robust_backtest" | "paper" | "live" | null;
   sharpe: number | null;
   maxDd: number | null;
   cagr: number | null;
+  validationPassed: boolean | null;
+  validationFoldCount: number | null;
+  validationPrimaryProfile: string | null;
+  foldSharpeFirst: number | null;
+  foldSharpeLast: number | null;
+  foldSharpeDelta: number | null;
+  foldSharpeMin: number | null;
+  foldSharpeMax: number | null;
+  validationFailReasons: string[];
+  validationFolds: ResearchValidationFold[];
+  validationGates: ResearchValidationGates | null;
+  paperDays: number | null;
+  paperRoundTrips: number | null;
+  paperSharpe20d: number | null;
+  paperMaxDrawdown: number | null;
+  paperGateDaysOk: boolean | null;
+  paperGateRoundTripsOk: boolean | null;
+  paperGateRiskOk: boolean | null;
+  lastLifecycleAction: string | null;
+  lastLifecycleReason: string | null;
+  lastLifecycleBy: string | null;
+  lastLifecycleAt: string | null;
+  lastLifecycleRecheckAfter: string | null;
+};
+
+export type ResearchValidationGates = {
+  minFoldCount: number | null;
+  minTradesPerFold: number | null;
+  minSharpe: number | null;
+  minCagr: number | null;
+  minMaxDd: number | null;
+};
+
+export type ResearchValidationFoldProfile = {
+  sharpe: number | null;
+  cagr: number | null;
+  maxDd: number | null;
+  tradeCount: number | null;
+};
+
+export type ResearchValidationFold = {
+  fold: number;
+  trainStart: string;
+  trainEnd: string;
+  testStart: string;
+  testEnd: string;
+  signalCount: number;
+  momentumThreshold: number | null;
+  skipped: boolean;
+  skipReason: string | null;
+  profiles: Record<string, ResearchValidationFoldProfile>;
 };
 
 export type ResearchFundamentalSnapshot = {
@@ -224,4 +483,20 @@ export type ResearchAgentTask = {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+};
+
+export type ResearchLifecycleReview = {
+  id: string;
+  strategyId: string;
+  strategyName: string;
+  strategyVersionId: string | null;
+  action: string;
+  fromStatus: string;
+  toStatus: string;
+  liveCandidate: boolean;
+  reason: string | null;
+  recheckCondition: string | null;
+  recheckAfter: string | null;
+  actedBy: string;
+  actedAt: string;
 };

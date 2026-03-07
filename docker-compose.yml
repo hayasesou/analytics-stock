@@ -6,6 +6,13 @@ x-worker-base: &worker-base
     - .env
   environment:
     TZ: ${TZ:-Asia/Tokyo}
+    GATEWAY_BINANCE_API_KEY: ""
+    GATEWAY_BINANCE_API_SECRET: ""
+    KABU_STATION_API_PASSWORD: ""
+    KABU_STATION_API_TOKEN: ""
+    IBKR_ACCOUNT_ID: ""
+    BINANCE_LIVE_ENABLED: "0"
+    HYPERLIQUID_LIVE_ENABLED: "0"
   volumes:
     - ./config.yaml:/app/config.yaml:ro
 
@@ -34,19 +41,115 @@ services:
       - "3000:3000"
     restart: unless-stopped
 
+  gateway-crypto:
+    build:
+      context: ./gateway/crypto
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      CRYPTO_GATEWAY_HOST: 0.0.0.0
+      CRYPTO_GATEWAY_PORT: 8080
+      CRYPTO_GATEWAY_STATE_PATH: /data/crypto_gateway.sqlite3
+      CRYPTO_GATEWAY_DRY_RUN: ${CRYPTO_GATEWAY_DRY_RUN:-1}
+      CRYPTO_GATEWAY_HTTP_TIMEOUT_SEC: ${CRYPTO_GATEWAY_HTTP_TIMEOUT_SEC:-5}
+      CRYPTO_GATEWAY_AUTH_TOKEN: ${CRYPTO_GATEWAY_AUTH_TOKEN:-}
+      BINANCE_LIVE_ENABLED: ${BINANCE_LIVE_ENABLED:-0}
+      HYPERLIQUID_LIVE_ENABLED: ${HYPERLIQUID_LIVE_ENABLED:-0}
+      GATEWAY_BINANCE_API_KEY: ${GATEWAY_BINANCE_API_KEY:-}
+      GATEWAY_BINANCE_API_SECRET: ${GATEWAY_BINANCE_API_SECRET:-}
+    volumes:
+      - gateway-crypto-data:/data
+    restart: unless-stopped
+
+  gateway-jp:
+    build:
+      context: ./gateway/jp
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      JP_GATEWAY_HOST: 0.0.0.0
+      JP_GATEWAY_PORT: 8081
+      JP_GATEWAY_STATE_PATH: /data/jp_gateway.sqlite3
+      JP_GATEWAY_DRY_RUN: ${JP_GATEWAY_DRY_RUN:-1}
+      JP_GATEWAY_HTTP_TIMEOUT_SEC: ${JP_GATEWAY_HTTP_TIMEOUT_SEC:-5}
+      JP_GATEWAY_MAX_RETRIES: ${JP_GATEWAY_MAX_RETRIES:-2}
+      JP_GATEWAY_RETRY_SLEEP_SEC: ${JP_GATEWAY_RETRY_SLEEP_SEC:-0.25}
+      JP_GATEWAY_RATE_LIMIT_PER_SEC: ${JP_GATEWAY_RATE_LIMIT_PER_SEC:-5}
+      JP_GATEWAY_PER_SYMBOL_LIMIT_PER_SEC: ${JP_GATEWAY_PER_SYMBOL_LIMIT_PER_SEC:-5}
+      JP_GATEWAY_WAIT_TIMEOUT_SEC: ${JP_GATEWAY_WAIT_TIMEOUT_SEC:-2}
+      JP_GATEWAY_AUTH_TOKEN: ${JP_GATEWAY_AUTH_TOKEN:-}
+      KABU_STATION_BASE_URL: ${KABU_STATION_BASE_URL:-http://host.docker.internal:18080/kabusapi}
+      KABU_STATION_API_PASSWORD: ${KABU_STATION_API_PASSWORD:-}
+      KABU_STATION_API_TOKEN: ${KABU_STATION_API_TOKEN:-}
+    volumes:
+      - gateway-jp-data:/data
+    restart: unless-stopped
+
+  gateway-us:
+    build:
+      context: ./gateway/us
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      US_GATEWAY_HOST: 0.0.0.0
+      US_GATEWAY_PORT: 8090
+      US_GATEWAY_STATE_PATH: /data/us_gateway.sqlite3
+      US_GATEWAY_DRY_RUN: ${US_GATEWAY_DRY_RUN:-1}
+      US_GATEWAY_AUTH_TOKEN: ${US_GATEWAY_AUTH_TOKEN:-}
+      IBKR_LIVE_ENABLED: ${IBKR_LIVE_ENABLED:-0}
+      IBKR_HOST: ${IBKR_HOST:-127.0.0.1}
+      IBKR_PORT: ${IBKR_PORT:-4002}
+      IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1301}
+      IBKR_ACCOUNT_ID: ${IBKR_ACCOUNT_ID:-}
+      IBKR_CONNECT_TIMEOUT_SEC: ${IBKR_CONNECT_TIMEOUT_SEC:-5}
+      IBKR_RECONNECT_ATTEMPTS: ${IBKR_RECONNECT_ATTEMPTS:-3}
+      IBKR_RECONNECT_BACKOFF_SEC: ${IBKR_RECONNECT_BACKOFF_SEC:-1}
+    volumes:
+      - gateway-us-data:/data
+    restart: unless-stopped
+
   worker:
     <<: *worker-base
     command: ["python", "-m", "src.main", "scheduler"]
+    depends_on:
+      - gateway-crypto
+      - gateway-jp
+      - gateway-us
     restart: unless-stopped
 
   executor:
     <<: *worker-base
     command: ["python", "-m", "src.main", "executor"]
+    depends_on:
+      - gateway-crypto
+      - gateway-jp
+      - gateway-us
     restart: unless-stopped
 
   agents:
     <<: *worker-base
     command: ["python", "-m", "src.main", "agents"]
+    restart: unless-stopped
+
+  research-chat:
+    <<: *worker-base
+    command: ["python", "-m", "src.main", "research_chat"]
+    restart: unless-stopped
+
+  discord-listener:
+    <<: *worker-base
+    command: ["python", "-m", "src.main", "discord_listener"]
+    restart: unless-stopped
+
+  discord-research-listener:
+    <<: *worker-base
+    command: ["python", "-m", "src.main", "discord_research_listener"]
     restart: unless-stopped
 
   worker-daily:
@@ -63,3 +166,13 @@ services:
     <<: *worker-base
     command: ["python", "-m", "src.main", "research"]
     profiles: ["jobs"]
+
+  worker-research-chat:
+    <<: *worker-base
+    command: ["python", "-m", "src.main", "research_chat"]
+    profiles: ["jobs"]
+
+volumes:
+  gateway-crypto-data:
+  gateway-jp-data:
+  gateway-us-data:
