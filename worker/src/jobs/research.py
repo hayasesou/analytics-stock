@@ -372,8 +372,6 @@ def _run_strategy_lifecycle(
             summary["demoted_live_candidate"] += 1
 
     return summary
-
-
 def run_research(limit: int | None = None) -> str:
     cfg = load_yaml_config()
     secrets = load_runtime_secrets()

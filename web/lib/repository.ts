@@ -92,7 +92,6 @@ function clampEdgeLimit(limit: number): number {
   }
   return Math.min(500, Math.max(1, Math.trunc(limit)));
 }
-
 function mapSecurityIdentityRow(row: {
   security_id: string;
   market: "JP" | "US";

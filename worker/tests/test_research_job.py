@@ -165,7 +165,6 @@ class _FakeNotifier:
             }
         )
 
-
 def test_run_research_creates_candidates_and_tasks(monkeypatch):
     fake_repo = _FakeRepo("postgresql://unused")
     monkeypatch.setattr(
