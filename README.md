@@ -87,6 +87,14 @@ docker compose down
 - `/events`: `docs/screens/events.md`
 - `/chat`: `docs/screens/chat.md`
 
+## AIで読むときの入口
+
+- 全体ルール: `AGENTS.md`
+- Claude 向け簡易版: `CLAUDE.md`
+- storage code map: `worker/src/storage/README.md`
+- web repository code map: `web/lib/repository/README.md`
+- jobs code map: `worker/src/jobs/README.md`
+
 ## 構成
 
 - `worker/`: Lightsail 常駐の Python Worker（収集・解析・レポート・通知）

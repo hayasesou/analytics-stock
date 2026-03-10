@@ -1,0 +1,20 @@
+{
+  "include": [
+    "worker/src/**/*.py",
+    "web/lib/**/*.ts",
+    "gateway/**/*.py"
+  ],
+  "exclude": [
+    "web/node_modules/**",
+    "web/.next/**",
+    "web/.next-local/**",
+    "worker/.venv/**",
+    "worker/build/**"
+  ],
+  "default": {
+    "max_lines": 400,
+    "max_bytes": 16384,
+    "reason": "default budget"
+  },
+  "exceptions": {}
+}

@@ -358,6 +358,25 @@ def test_execute_python_returns_stdout():
     assert "value" in result["stdout"]
 
 
+def test_execute_python_allows_safe_imports():
+    result = research_chat_job._execute_python(  # noqa: SLF001
+        "import math\nreturns = [0.01, -0.005, 0.012, 0.004]\nmean_ret = sum(returns) / len(returns)\nvariance = sum((x - mean_ret) ** 2 for x in returns) / len(returns)\nprint(round(math.sqrt(variance), 6))"
+    )
+
+    assert result["stdout"].strip() == "0.00661"
+
+
+def test_fallback_chart_specs_from_python_stdout_dict() -> None:
+    specs = research_chat_job._fallback_chart_specs_from_python_result(  # noqa: SLF001
+        {"stdout": "{'symbol': 'US:NVDA', 'mean_return': 0.01, 'volatility': 0.02}"},
+        "Python Analysis Draft",
+    )
+
+    assert specs
+    assert specs[0]["kind"] == "bar"
+    assert len(specs[0]["series"][0]["data"]) == 2
+
+
 def test_fallback_chart_specs_from_sql_result_returns_multiple_specs() -> None:
     specs = research_chat_job._fallback_chart_specs_from_sql_result(  # noqa: SLF001
         {"rows": [["2026-03-07", 121.23], ["2026-03-08", 122.1]]},
